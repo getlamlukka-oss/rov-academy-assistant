@@ -1,0 +1,11 @@
+# RoV Academy Assistant
+
+RoV Academy Assistant is a mobile-first web application for working with a user-provided RoV Academy question knowledge base.
+
+## Main capabilities
+- User authentication
+- Knowledge-base question matching
+- Browser worker status and session control
+- Gemini-assisted semantic matching when configured
+
+The application does not bypass CAPTCHA, OTP, or 2FA. Authentication challenges are completed by the user.

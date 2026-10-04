@@ -1,0 +1,97 @@
+@import url('https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;500;600;700&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 258 30% 5%;
+    --foreground: 255 20% 96%;
+    --card: 258 24% 8%;
+    --card-foreground: 255 20% 96%;
+    --popover: 258 24% 7%;
+    --popover-foreground: 255 20% 96%;
+    --primary: 258 90% 66%;
+    --primary-foreground: 258 30% 6%;
+    --secondary: 258 20% 14%;
+    --secondary-foreground: 255 20% 96%;
+    --muted: 258 20% 13%;
+    --muted-foreground: 255 10% 64%;
+    --accent: 190 95% 60%;
+    --accent-foreground: 200 40% 6%;
+    --destructive: 0 72% 58%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 258 18% 18%;
+    --input: 258 18% 18%;
+    --ring: 258 90% 66%;
+    --chart-1: 258 90% 66%;
+    --chart-2: 190 95% 60%;
+    --chart-3: 0 72% 58%;
+    --chart-4: 43 96% 62%;
+    --chart-5: 280 65% 60%;
+    --radius: 0.75rem;
+    --font-heading: "Kanit", ui-sans-serif, system-ui, sans-serif;
+    --font-body: "Kanit", ui-sans-serif, system-ui, sans-serif;
+    --font-display: "Kanit", ui-sans-serif, system-ui, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    --sidebar-background: 258 30% 5%;
+    --sidebar-foreground: 255 20% 96%;
+    --sidebar-primary: 258 90% 66%;
+    --sidebar-primary-foreground: 258 30% 6%;
+    --sidebar-accent: 258 20% 14%;
+    --sidebar-accent-foreground: 255 20% 96%;
+    --sidebar-border: 258 18% 18%;
+    --sidebar-ring: 258 90% 66%;
+  }
+
+  .dark {
+    --background: 258 30% 5%;
+    --foreground: 255 20% 96%;
+    --card: 258 24% 8%;
+    --card-foreground: 255 20% 96%;
+    --popover: 258 24% 7%;
+    --popover-foreground: 255 20% 96%;
+    --primary: 258 90% 66%;
+    --primary-foreground: 258 30% 6%;
+    --secondary: 258 20% 14%;
+    --secondary-foreground: 255 20% 96%;
+    --muted: 258 20% 13%;
+    --muted-foreground: 255 10% 64%;
+    --accent: 190 95% 60%;
+    --accent-foreground: 200 40% 6%;
+    --destructive: 0 72% 58%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 258 18% 18%;
+    --input: 258 18% 18%;
+    --ring: 258 90% 66%;
+    --chart-1: 258 90% 66%;
+    --chart-2: 190 95% 60%;
+    --chart-3: 0 72% 58%;
+    --chart-4: 43 96% 62%;
+    --chart-5: 280 65% 60%;
+    --sidebar-background: 258 30% 5%;
+    --sidebar-foreground: 255 20% 96%;
+    --sidebar-primary: 258 90% 66%;
+    --sidebar-primary-foreground: 258 30% 6%;
+    --sidebar-accent: 258 20% 14%;
+    --sidebar-accent-foreground: 255 20% 96%;
+    --sidebar-border: 258 18% 18%;
+    --sidebar-ring: 258 90% 66%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground font-body;
+  }
+}
+
+@layer utilities {
+  .card-glow {
+    box-shadow: 0 0 28px hsl(258 90% 66% / 0.1);
+  }
+}
