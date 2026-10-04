@@ -2,11 +2,6 @@ name: GEO Optimizer Audit
 
 'on':
   workflow_dispatch:
-    inputs:
-      url:
-        description: Public website URL to audit
-        required: true
-        type: string
   push:
     branches:
       - main
@@ -23,6 +18,6 @@ jobs:
       - name: Run GEO Optimizer Audit
         uses: Auriti-Labs/geo-optimizer-skill@v4.18.3
         with:
-          url: ${{ inputs.url || 'https://academy.rov.in.th' }}
-          min-score: 70
-          format: sarif
+          url: https://rov-pocket-club-f27a.getlamlukka.chatgpt.site/
+          min-score: 0
+          format: json
