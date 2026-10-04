@@ -1,0 +1,23 @@
+name: GEO Optimizer Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Public website URL to audit"
+        required: true
+        type: string
+
+jobs:
+  geo-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Run GEO Optimizer Audit
+        uses: Auriti-Labs/geo-optimizer-skill@v4.18.3
+        with:
+          url: ${{ inputs.url }}
+          min-score: 70
+          format: sarif
