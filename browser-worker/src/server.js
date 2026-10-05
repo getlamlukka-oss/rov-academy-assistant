@@ -14,131 +14,110 @@ async function lock(s,fn){const prev=s.queue;s.queue=new Promise(r=>s.releaseQue
 function find(req){const s=sessions.get(req.params.id);if(!s)throw Error('ไม่พบเซสชัน กรุณาสร้างใหม่');s.used=Date.now();return s;}
 const wrap=fn=>async(req,res)=>{try{await fn(req,res);}catch(e){res.status(409).json({error:e.message?.slice(0,220)||'Worker error'});}};
 app.use((req,res,next)=>{res.set({'Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff','Strict-Transport-Security':'max-age=31536000','Permissions-Policy':'camera=(), microphone=(), geolocation=(), payment=(), usb=()'});next();});
-app.get('/health',(_req,res)=>res.json({ok:true,version:'2.3.1',service:'rov-browser-worker',sessions:sessions.size,starting:creating.size,configured:tokens.length>0,capabilities:{idempotentSessions:true,credentialLogin:true,loginReadiness:true}}));
-// A session-specific view capability is exchanged for an HttpOnly cookie. It never exposes the service token.
-app.get('/live/:id',wrap(async(req,res)=>{find(req);const nonce=crypto.randomBytes(18).toString('base64');res.set('Content-Security-Policy',"default-src 'none'; img-src 'self' blob:; style-src 'unsafe-inline'; script-src 'nonce-"+nonce+"'; connect-src 'self'; frame-ancestors 'self' https://rov-academy-sites-v2.getlamlukka.chatgpt.site https://chatgpt.com https://*.chatgpt.com; base-uri 'none'; form-action 'none'");res.type('html').send(LIVE_HTML.replace('<script>','<script nonce="'+nonce+'">'));}));
-app.post('/live/:id/auth',wrap(async(req,res)=>{const s=find(req);if(!equal(req.body.key,s.viewKey))return res.status(401).json({error:'ลิงก์หมดอายุหรือไม่ถูกต้อง'});const name='view_'+s.id.replaceAll('-','');res.cookie(name,s.viewKey,{httpOnly:true,secure:process.env.NODE_ENV!=='test',sameSite:'strict',path:'/live/'+s.id,maxAge:30*60*1000});res.json({ok:true});}));
-function liveAuth(req,res,next){const s=sessions.get(req.params.id);const name='view_'+String(req.params.id).replaceAll('-','');const cookie=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith(name+'='))?.slice(name.length+1);if(!s||!equal(cookie,s.viewKey)&&!equal(req.headers['x-view-key'],s.viewKey))return res.status(401).json({error:'เปิดลิงก์ล็อกอินใหม่จากเว็บผู้ช่วย'});if(req.method!=='GET'&&req.headers.origin!==new URL(process.env.PUBLIC_WORKER_URL||'https://'+req.headers.host).origin)return res.status(403).json({error:'Invalid origin'});s.used=Date.now();next();}
-app.get('/live/:id/screen',liveAuth,wrap(async(req,res)=>{const s=find(req);const jpeg=await lock(s,()=>s.page.screenshot({type:'jpeg',quality:65,timeout:8000}));res.type('jpeg').send(jpeg);}));
-app.post('/live/:id/input',liveAuth,wrap(async(req,res)=>{const s=find(req);if(s.auto)return res.status(409).json({error:'หยุดออโต้ก่อนควบคุมหน้าจอ'});const b=req.body;await lock(s,async()=>{if(b.kind==='click'){if(!Number.isFinite(b.x)||!Number.isFinite(b.y)||b.x<0||b.x>412||b.y<0||b.y>820)throw Error('Invalid position');await s.page.mouse.click(b.x,b.y);}else if(b.kind==='drag'){if(!Array.isArray(b.points)||b.points.length<2||b.points.length>64||b.points.some(p=>!Number.isFinite(p.x)||!Number.isFinite(p.y)||p.x<0||p.x>412||p.y<0||p.y>820))throw Error('Invalid drag');await s.page.mouse.move(b.points[0].x,b.points[0].y);await s.page.mouse.down();try{for(const p of b.points.slice(1))await s.page.mouse.move(p.x,p.y);}finally{await s.page.mouse.up();}}else if(b.kind==='text'){await s.page.keyboard.insertText(String(b.text||'').slice(0,1000));}else if(b.kind==='key'){if(!['Enter','Tab','Backspace','Escape','Control+A'].includes(b.key))throw Error('Invalid key');await s.page.keyboard.press(b.key);}else if(b.kind==='scroll'){await s.page.mouse.wheel(0,Number(b.delta)>0?500:-500);}else throw Error('Invalid input');});res.json({ok:true});}));
-app.post('/live/:id/pause',liveAuth,wrap(async(req,res)=>{const s=find(req);s.auto=false;s.generation++;addLog(s,'หยุดออโต้จากหน้าล็อกอิน');res.json({ok:true});}));
-// Expiring static layout audit. It never connects to the private Site and accepts no Site credentials.
-app.post('/diagnostics/layout',async(req,res)=>{
- if(Date.now()>Number(process.env.DIAGNOSTICS_EXPIRES_AT||0)||!process.env.DIAGNOSTICS_TOKEN||!equal(req.headers.authorization,'Bearer '+process.env.DIAGNOSTICS_TOKEN))return res.status(401).json({error:'Unauthorized'});
- let browser;
- if(typeof req.body.markup!=='string'||typeof req.body.css!=='string'||req.body.markup.includes('<script'))return res.status(400).json({error:'Invalid static fixture'});
- try{
-  browser=await chromium.launch({headless:true,args:['--no-sandbox','--disable-dev-shm-usage'],timeout:45000});
-  const context=await browser.newContext(),page=await context.newPage(),views=[];
-  await context.route('**/*',r=>r.abort());
-  await page.setContent('<html lang="th"><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>'+req.body.css+'</style></head><body>'+req.body.markup+'</body></html>');
-  for(const [width,height]of [[375,667],[768,1024],[1440,900]]){
-   await page.setViewportSize({width,height});await page.waitForTimeout(100);
-   const layout=await page.evaluate(()=>({width:innerWidth,scrollWidth:document.documentElement.scrollWidth,overflow:document.documentElement.scrollWidth>innerWidth,unnamedButtons:[...document.querySelectorAll('button')].filter(e=>!e.getAttribute('aria-label')&&!e.textContent?.trim()).length,missingAlt:document.querySelectorAll('img:not([alt])').length,formPresent:!!document.querySelector('input[name=username]')&&!!document.querySelector('input[name=password]')}));
-   const screenshot=await page.screenshot({type:'png'});views.push({viewport:{width,height},...layout,screenshot:screenshot.toString('base64')});
-  }
-  await page.setViewportSize({width:375,height:667});const focus=[];
-  for(let i=0;i<12;i++){await page.keyboard.press('Tab');focus.push(await page.evaluate(()=>({tag:document.activeElement.tagName,name:document.activeElement.getAttribute('aria-label')||document.activeElement.getAttribute('name')||document.activeElement.textContent?.trim().slice(0,60)})));}
-  res.json({ok:true,views,focus,staticFixture:true,privateSiteVisited:false});
- }catch{res.status(503).json({error:'Layout audit unavailable'});}finally{await browser?.close().catch(()=>{});}
-});
-app.post('/diagnostics/login',async(req,res)=>{
- if(Date.now()>Number(process.env.DIAGNOSTICS_EXPIRES_AT||0)||!process.env.DIAGNOSTICS_TOKEN||!equal(req.headers.authorization,'Bearer '+process.env.DIAGNOSTICS_TOKEN))return res.status(401).json({error:'Unauthorized'});
- let browser;
- try{
-  browser=await chromium.launch({headless:true,args:['--no-sandbox','--disable-dev-shm-usage'],timeout:45000});
-  const context=await browser.newContext({viewport:{width:412,height:820}}),page=await context.newPage();
-  await context.route('**/*',r=>r.request().isNavigationRequest()&&r.request().frame()===page.mainFrame()&&!safeHost(r.request().url())?r.abort():r.continue());
-  const s={page,state:'CREATED'};const started=Date.now();const prepared=await prepareLogin(s),snapshot=await loginSnapshot(page).catch(()=>null);
-  let fillProbe=null;if(prepared.ready&&req.body.fillProbe===true){const password=page.locator('input[type="password"]:visible'),form=password.locator('xpath=ancestor::form[1]'),root=await form.count()===1?form:page,username=root.locator('input[type="text"]:visible:not([readonly]),input[type="email"]:visible:not([readonly]),input[type="tel"]:visible:not([readonly])');try{await username.fill('diagnostic-ui-check',{timeout:7000});await password.fill('not-a-real-password',{timeout:7000});fillProbe={usernameFilled:await username.inputValue()==='diagnostic-ui-check',passwordFilled:await password.inputValue()==='not-a-real-password',submitClicked:false};}finally{await username.fill('').catch(()=>{});await password.fill('').catch(()=>{});}}res.json({ok:true,elapsedMs:Date.now()-started,prepared,snapshot,fillProbe,credentialsSubmitted:false});
- }catch{res.status(503).json({error:'Browser diagnostic unavailable'});}finally{await browser?.close().catch(()=>{});}
-});
+app.get('/health',(_req,res)=>res.json({ok:true,version:'2.4.0',service:'rov-browser-worker',sessions:sessions.size,starting:creating.size,configured:tokens.length>0,capabilities:{idempotentSessions:true,credentialLogin:true,loginReadiness:true,automaticFlow:true,aiJobs:true}}));
 app.use((req,res,next)=>{if(!tokens.length)return res.status(503).json({error:'Worker token not configured'});if(!tokens.some(t=>equal(req.headers.authorization,'Bearer '+t)))return res.status(401).json({error:'Unauthorized'});next();});
 // Check the authenticated profile/logout UI rendered by Academy (mobile menu may be collapsed). Never read login tokens or infer login from URL.
-async function loggedIn(s){if(new URL(s.page.url()).hostname!=='academy.rov.in.th')return false;return s.page.evaluate(()=>{const visible=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&getComputedStyle(e).visibility!=='hidden'};const els=[...document.querySelectorAll('button,a,[role=button]')].filter(visible);const logout=e=>/^(ออกจากระบบ|ล็อกเอาท์|logout|log out)$/i.test((e.textContent||'').trim());const profile=document.querySelector('.menuright .user .name');const menuLabels=[...document.querySelectorAll('.menuright span,.menuright [role=button]')];return els.some(logout)||!!profile?.textContent?.trim()&&menuLabels.some(logout);}).catch(()=>false);}
+async function loggedIn(s){
+ if(new URL(s.page.url()).hostname!=='academy.rov.in.th'){s.loggedIn=false;return false;}
+ const authenticated=await s.page.evaluate(()=>{
+  const logout=e=>/^(ออกจากระบบ|ล็อกเอาท์|logout|log out)$/i.test((e.textContent||'').trim());
+  const navbar=document.querySelector('.navbar--pc');
+  const desktopProfile=navbar?.querySelector('.name');
+  const drawerProfile=document.querySelector('.menuright .user .name');
+  const menus=[...document.querySelectorAll('.navbar--pc button,.navbar--pc span,.menuright span,.menuright [role=button]')];
+  return !!(desktopProfile?.textContent?.trim()||drawerProfile?.textContent?.trim())&&menus.some(logout);
+ }).catch(()=>false);s.loggedIn=authenticated;return authenticated;
+}
 // Academy's published OAuth configuration: app 100055, Garena platform 1, its own callback.
 const GARENA_LOGIN='https://100055.connect.garena.com/oauth/login?response_type=code&client_id=100055&redirect_uri=https%3A%2F%2Facademy.rov.in.th%2Fauth%2Fcallback%2F&locale=th-TH&platform=1';
 function credentialHost(url){try{const u=new URL(url);return u.protocol==='https:'&&['100055.connect.garena.com','sso.garena.com','auth.garena.com','account.garena.com'].includes(u.hostname);}catch{return false;}}
 const loginMessages={
- CAPTCHA_REQUIRED:'Garena ต้องการยืนยัน CAPTCHA กรุณาทำในหน้าจอด้านล่าง แล้วกดเข้าสู่ระบบอีกครั้ง',
- LOGIN_FORM_UNAVAILABLE:'Garena ยังไม่แสดงช่องล็อกอิน กรุณาตรวจหน้าจอด้านล่างแล้วลองอีกครั้ง',
- LOGIN_INPUT_NOT_READY:'ช่องล็อกอิน Garena ยังไม่พร้อมกรอก กรุณาตรวจหน้าจอด้านล่าง',
- LOGIN_REJECTED:'Garena ยังไม่ยอมรับการล็อกอิน กรุณาตรวจข้อความในหน้าจอด้านล่าง',
- LOGIN_PENDING:'ส่งบัญชีไป Garena แล้ว กรุณาตรวจ CAPTCHA / OTP ในหน้าจอด้านล่าง',
- LOGIN_PAGE_UNAVAILABLE:'เปิดหน้าล็อกอิน Garena ไม่สำเร็จ กรุณาลองอีกครั้ง',
- LOGIN_READY:'หน้าล็อกอิน Garena พร้อมกรอกบัญชีแล้ว'
+ LOGIN_VERIFICATION_REQUIRED:'Garena ต้องการยืนยันเพิ่มเติม จึงเข้าสู่ระบบอัตโนมัติไม่สำเร็จ',
+ LOGIN_FORM_UNAVAILABLE:'Garena ไม่แสดงช่องบัญชีและรหัสผ่าน',
+ LOGIN_INPUT_NOT_READY:'ช่องล็อกอิน Garena ยังไม่พร้อมกรอก',
+ LOGIN_REJECTED:'Garena ปฏิเสธการเข้าสู่ระบบ',
+ LOGIN_TIMEOUT:'Garena ยังไม่ยืนยันการเข้าสู่ระบบภายในเวลาที่กำหนด',
+ LOGIN_PAGE_UNAVAILABLE:'เปิดหน้าล็อกอิน Garena ไม่สำเร็จ'
 };
 async function loginSnapshot(page){return page.evaluate(()=>{
  const visible=e=>{const r=e.getBoundingClientRect(),c=getComputedStyle(e);return r.width>0&&r.height>0&&c.display!=='none'&&c.visibility!=='hidden';};
- const inputs=[...document.querySelectorAll('input')].filter(visible);
- const passwords=inputs.filter(e=>e.type==='password');const form=passwords[0]?.closest('form');
+ const inputs=[...document.querySelectorAll('input')].filter(visible),passwords=inputs.filter(e=>e.type==='password'),form=passwords[0]?.closest('form');
  const usernames=(form?[...form.querySelectorAll('input')]:inputs).filter(e=>visible(e)&&['text','email','tel'].includes(e.type)&&!e.readOnly);
- const challenge=[...document.querySelectorAll('iframe[src*="captcha"],iframe[src*="datadome"],[id*=captcha],[class*=captcha]')].some(visible);
- const rejected=[...document.querySelectorAll('.field.error,.form-error,[role=alert]')].some(e=>visible(e)&&e.textContent?.trim());
- return {host:location.hostname,passwordCount:passwords.length,usernameCount:usernames.length,editable:passwords.length===1&&usernames.length===1&&!passwords[0].disabled&&!passwords[0].readOnly&&!usernames[0].disabled,challenge,rejected,fields:inputs.map(e=>({type:e.type,disabled:e.disabled,readOnly:e.readOnly}))};
+ const verificationRequired=[...document.querySelectorAll('iframe[src*="captcha"],iframe[src*="datadome"],[id*=captcha],[class*=captcha],input[autocomplete=one-time-code]')].some(visible);
+ const errors=[...document.querySelectorAll('.field.error,.form-error,[role=alert]')].filter(e=>visible(e)&&e.textContent?.trim()).map(e=>e.textContent.trim().slice(0,500));
+ return {host:location.hostname,passwordCount:passwords.length,usernameCount:usernames.length,editable:passwords.length===1&&usernames.length===1&&!passwords[0].disabled&&!passwords[0].readOnly&&!usernames[0].disabled,verificationRequired,errors};
  });}
-function waitingLogin(s,reason,submitted=false){s.state=reason==='CAPTCHA_REQUIRED'?'WAITING_CHALLENGE':'WAITING_LOGIN';return {loggedIn:false,submitted,needsInteraction:true,reason,message:loginMessages[reason]};}
+function loginFailure(s,reason,message){s.state='LOGIN_FAILED';return {loggedIn:false,state:s.state,reason,message:message||loginMessages[reason]};}
+function safeLoginMessage(message,credentials){
+ let text=String(message||'');for(const value of [credentials.username,credentials.password])if(value)text=text.split(value).join('[ปกปิด]');
+ return text.replace(/https?:\/\/\S+/g,'[URL]').slice(0,350);
+}
 async function prepareLogin(s){
- if(await loggedIn(s))return {loggedIn:true,submitted:false};
- if(!credentialHost(s.page.url())){try{await s.page.goto(GARENA_LOGIN,{waitUntil:'commit',timeout:15000});}catch{return waitingLogin(s,'LOGIN_PAGE_UNAVAILABLE');}}
+ if(await loggedIn(s))return {loggedIn:true};
+ if(!credentialHost(s.page.url())){try{await s.page.goto(GARENA_LOGIN,{waitUntil:'commit',timeout:15000});}catch{return loginFailure(s,'LOGIN_PAGE_UNAVAILABLE');}}
  const until=Date.now()+20000;
  while(Date.now()<until){
-  if(await loggedIn(s))return {loggedIn:true,submitted:false};
+  if(await loggedIn(s))return {loggedIn:true};
   if(credentialHost(s.page.url())){
    const v=await loginSnapshot(s.page).catch(()=>null);
-   if(v?.challenge)return waitingLogin(s,'CAPTCHA_REQUIRED');
-   if(v?.editable){s.state='LOGIN_READY';return {loggedIn:false,ready:true,reason:'LOGIN_READY',message:loginMessages.LOGIN_READY};}
+   if(v?.verificationRequired)return loginFailure(s,'LOGIN_VERIFICATION_REQUIRED');
+   if(v?.editable){s.state='LOGGING_IN';return {ready:true};}
   }
   await sleep(400);
  }
  const v=await loginSnapshot(s.page).catch(()=>null);
- return waitingLogin(s,v?.challenge?'CAPTCHA_REQUIRED':v?.passwordCount?'LOGIN_INPUT_NOT_READY':'LOGIN_FORM_UNAVAILABLE');
+ return loginFailure(s,v?.verificationRequired?'LOGIN_VERIFICATION_REQUIRED':v?.passwordCount?'LOGIN_INPUT_NOT_READY':'LOGIN_FORM_UNAVAILABLE');
 }
 async function enterCredentials(s,b){
- if(s.auto)throw Error('Pause first');
- let submitted=false,stage='prepare';s.enteringCredentials=true;
+ if(s.auto)throw Error('หยุดการตอบคำถามก่อนล็อกอินใหม่');
+ let stage='prepare';s.enteringCredentials=true;
  try{
-  const prepared=await prepareLogin(s);if(!prepared.ready)return prepared;
-  stage='recognize-form';const password=s.page.locator('input[type="password"]:visible');
-  const form=password.locator('xpath=ancestor::form[1]');const root=await form.count()===1?form:s.page;
+  const prepared=await prepareLogin(s);if(prepared.loggedIn)return {loggedIn:true,state:'LOGGED_IN'};if(!prepared.ready)return prepared;
+  stage='recognize-form';const password=s.page.locator('input[type="password"]:visible'),form=password.locator('xpath=ancestor::form[1]'),root=await form.count()===1?form:s.page;
   const username=root.locator('input[type="text"]:visible:not([readonly]),input[type="email"]:visible:not([readonly]),input[type="tel"]:visible:not([readonly])');
-  if(!credentialHost(s.page.url())||await password.count()!==1||await username.count()!==1)return waitingLogin(s,'LOGIN_FORM_UNAVAILABLE');
-  const safeForm=await password.evaluate(e=>{const f=e.closest('form'),a=f?.getAttribute('action');if(!a)return true;const u=new URL(a,location.href);return u.protocol==='https:'&&['100055.connect.garena.com','sso.garena.com','auth.garena.com','account.garena.com'].includes(u.hostname);});
-  if(!safeForm)return waitingLogin(s,'LOGIN_FORM_UNAVAILABLE');
-  stage='fill-username';await username.fill(b.username,{timeout:7000});
-  if(!credentialHost(s.page.url()))return waitingLogin(s,'LOGIN_FORM_UNAVAILABLE');
-  stage='fill-password';await password.fill(b.password,{timeout:7000});b.username='';b.password='';
+  if(!credentialHost(s.page.url())||await password.count()!==1||await username.count()!==1)return loginFailure(s,'LOGIN_FORM_UNAVAILABLE');
+  const safeForm=await password.evaluate(e=>{const a=e.closest('form')?.getAttribute('action');if(!a)return true;const u=new URL(a,location.href);return u.protocol==='https:'&&['100055.connect.garena.com','sso.garena.com','auth.garena.com','account.garena.com'].includes(u.hostname);});
+  if(!safeForm)return loginFailure(s,'LOGIN_FORM_UNAVAILABLE');
+  stage='fill-username';await username.fill(b.username,{timeout:7000});if(!credentialHost(s.page.url()))return loginFailure(s,'LOGIN_FORM_UNAVAILABLE');
+  stage='fill-password';await password.fill(b.password,{timeout:7000});
   const button=root.locator('button[type="submit"]:visible,input[type="submit"]:visible');
-  if(!credentialHost(s.page.url())||await button.count()!==1)return waitingLogin(s,'LOGIN_FORM_UNAVAILABLE');
-  stage='submit';await button.click({timeout:7000});submitted=true;
-  const until=Date.now()+6000;
+  if(!credentialHost(s.page.url())||await button.count()!==1)return loginFailure(s,'LOGIN_FORM_UNAVAILABLE');
+  stage='submit';await button.click({timeout:7000});
+  const until=Date.now()+15000;
   while(Date.now()<until){
-   if(await loggedIn(s)){s.state='WAITING_QUIZ';return {loggedIn:true,submitted:true,message:'ตรวจพบล็อกอิน Garena แล้ว'};}
+   if(await loggedIn(s)){s.state='LOGGED_IN';return {loggedIn:true,state:s.state};}
    const v=credentialHost(s.page.url())?await loginSnapshot(s.page).catch(()=>null):null;
-   if(v?.challenge)return waitingLogin(s,'CAPTCHA_REQUIRED',true);
-   if(v?.rejected)return waitingLogin(s,'LOGIN_REJECTED',true);
+   if(v?.verificationRequired)return loginFailure(s,'LOGIN_VERIFICATION_REQUIRED');
+   if(v?.errors?.length)return loginFailure(s,'LOGIN_REJECTED',safeLoginMessage(v.errors.join(' · '),b));
    await sleep(500);
   }
-  return waitingLogin(s,'LOGIN_PENDING',true);
- }catch{
-  let host='unknown';try{host=new URL(s.page.url()).hostname;}catch{}
-  console.warn(JSON.stringify({event:'login_flow',stage,host,reason:'LOGIN_INPUT_NOT_READY'}));
-  return waitingLogin(s,submitted?'LOGIN_PENDING':'LOGIN_INPUT_NOT_READY',submitted);
+  return loginFailure(s,'LOGIN_TIMEOUT');
+ }catch(e){
+  console.warn(JSON.stringify({event:'login_flow',stage,reason:'LOGIN_INPUT_NOT_READY'}));
+  return loginFailure(s,'LOGIN_INPUT_NOT_READY',loginMessages.LOGIN_INPUT_NOT_READY+' ('+stage+')');
  }finally{
   s.enteringCredentials=false;b.username='';b.password='';
-  if(!submitted&&!s.page.isClosed()&&credentialHost(s.page.url()))await s.page.locator('input[type="password"]').fill('',{timeout:1000}).catch(()=>{});
+  if(!s.page.isClosed()&&credentialHost(s.page.url())){
+   const fields=s.page.locator('input[type="password"],input[type="text"]:not([readonly]),input[type="email"],input[type="tel"]');
+   for(const field of await fields.all().catch(()=>[]))await field.fill('',{timeout:1000}).catch(()=>{});
+  }
  }
 }
 async function quiz(s){const data=await s.page.evaluate(({bank,selectors})=>{
  const n=v=>String(v||'').normalize('NFKC').toLowerCase().replace(/[\s\p{P}\p{S}]/gu,'');
  const visible=e=>{const r=e.getBoundingClientRect();const style=getComputedStyle(e);return r.width>0&&r.height>0&&style.visibility!=='hidden'&&style.display!=='none';};
  const txt=e=>(e?.innerText||e?.textContent||'').replace(/\s+/g,' ').trim();
- const body=document.body.innerText||'';const blocked=!!document.querySelector('iframe[src*="recaptcha"],iframe[src*="hcaptcha"]')&&/captcha|ยืนยัน.*มนุษย์/i.test(body);
+ const body=document.body.innerText||'';
+ const success=[...document.querySelectorAll('img[alt="Congratulations Title"]')].some(visible);
+ if(success)return {question:'',choices:[],targets:[],completed:true};
+ const modalText=[...document.querySelectorAll('.MuiModal-root,[role=dialog]')].filter(visible).map(txt).join(' ');
+ if(/ตอบผิด|ตอบไม่ครบ|ไม่ผ่าน|incorrect|wrongly|need to answer all/i.test(modalText))return {question:'',choices:[],targets:[],error:modalText.slice(0,350),completed:false};
+ const blocked=[...document.querySelectorAll('iframe[src*="captcha"],[id*=captcha],[class*=captcha]')].some(visible);
  if(blocked)return {blocked:true,question:'',choices:[],targets:[]};
  let elements=[];const radios=[...document.querySelectorAll('input[type=radio],[role=radio]')].filter(e=>visible(e)||e.labels&&[...e.labels].some(visible));
  if(radios.length>=2&&radios.length<=8)elements=radios.map(e=>e.labels?.[0]||e);
  if(!elements.length){for(const selector of [selectors.choice,'.item:has(.itemchoice)','[class*=choice]','[class*=option]'].filter(Boolean)){const found=[...document.querySelectorAll(selector)].filter(visible).filter(e=>txt(e).length>0&&txt(e).length<600);if(found.length>=2&&found.length<=8){elements=found;break;}}}
- if(elements.length<2)return {question:'',choices:[],targets:[],completed:/ทำแบบทดสอบเสร็จ|จบแบบทดสอบ|ผลการทดสอบ|quiz completed/i.test(body)};
+ if(elements.length<2)return {question:'',choices:[],targets:[],completed:false};
  const choices=elements.map(txt);let question='';let questionEls=selectors.question?[...document.querySelectorAll(selectors.question)].filter(visible):[];
  if(questionEls.length===1)question=txt(questionEls[0]);
  if(!question){const set=choices.map(n).sort().join('|');const candidates=bank.filter(q=>n(body).includes(n(q.question))&&Array.isArray(q.choices)&&q.choices.map(n).sort().join('|')===set);const unique=[...new Set(candidates.map(q=>q.question))];if(unique.length===1)question=unique[0];}
@@ -147,16 +126,84 @@ async function quiz(s){const data=await s.page.evaluate(({bank,selectors})=>{
  },{bank:s.bank,selectors:s.selectors});
  return {...data,fingerprint:hash(data)};
 }
-async function select(s,b){if(!await loggedIn(s))throw Error('ยังไม่พบการล็อกอิน Garena');const q=await quiz(s);if(q.blocked)throw Error('พบ CAPTCHA ให้ผู้ใช้ดำเนินการเอง');if(!q.question||q.fingerprint!==b.fingerprint)throw Error('คำถามเปลี่ยนแล้ว ยกเลิกคำตอบเก่า');const i=Number(b.choice_number)-1;if(!Number.isInteger(i)||i<0||i>=q.choices.length)throw Error('Invalid choice');if(s.acted.has(q.fingerprint))throw Error('คำถามนี้เลือกไปแล้ว ไม่ส่งซ้ำ');s.acted.add(q.fingerprint);const target=s.page.locator('[data-rov-worker-target="'+q.targets[i]+'"]');await target.click({timeout:5000});await sleep(200);const checked=await target.evaluate(e=>{const input=e.matches('input[type=radio]')?e:e.querySelector('input[type=radio]');return !!input?.checked||e.getAttribute('aria-checked')==='true'||e.getAttribute('aria-selected')==='true'||e.getAttribute('data-selected')==='true'||/(^|\s)(selected|active|checked)(\s|$)/.test(e.className);});if(!checked)throw Error('ยังยืนยันสถานะเลือกไม่ได้ กรุณาตรวจหน้าจอ');s.selected=q.fingerprint;return {ok:true};}
+async function select(s,b){if(!await loggedIn(s))throw Error('ยังไม่พบการล็อกอิน Garena');const q=await quiz(s);if(q.blocked)throw Error('Garena ต้องการยืนยันเพิ่มเติม ระบบหยุดการทำงาน');if(!q.question||q.fingerprint!==b.fingerprint)throw Error('คำถามเปลี่ยนแล้ว ยกเลิกคำตอบเก่า');const i=Number(b.choice_number)-1;if(!Number.isInteger(i)||i<0||i>=q.choices.length)throw Error('Invalid choice');if(s.acted.has(q.fingerprint))throw Error('คำถามนี้เลือกไปแล้ว ไม่ส่งซ้ำ');s.acted.add(q.fingerprint);const target=s.page.locator('[data-rov-worker-target="'+q.targets[i]+'"]');await target.click({timeout:5000});await sleep(200);const checked=await target.evaluate(e=>{const input=e.matches('input[type=radio]')?e:e.querySelector('input[type=radio]');return !!input?.checked||e.getAttribute('aria-checked')==='true'||e.getAttribute('aria-selected')==='true'||e.getAttribute('data-selected')==='true'||/(^|\s)(selected|active|checked)(\s|$)/.test(e.className);});if(!checked)throw Error('ยังยืนยันสถานะเลือกไม่ได้ กรุณาตรวจหน้าจอ');s.selected=q.fingerprint;return {ok:true};}
 async function next(s,b){if(!await loggedIn(s))throw Error('หลุดล็อกอิน หยุดการทำงาน');const q=await quiz(s);if(!s.selected||q.fingerprint!==s.selected||b.fingerprint&&b.fingerprint!==q.fingerprint)throw Error('คำถามเปลี่ยนหรือยังไม่ได้เลือก');if(s.submitted.has(q.fingerprint))throw Error('คำถามนี้ส่งไปแล้ว ไม่ส่งซ้ำ');const button=s.page.getByRole('button',{name:/^(ส่งคำตอบ|ยืนยันคำตอบ|ยืนยัน|ตอบ|submit|ถัดไป|ข้อถัดไป|ต่อไป|next)$/i});const visible=[];for(const e of await button.all())if(await e.isVisible()&&await e.isEnabled())visible.push(e);if(visible.length!==1)throw Error('ปุ่มส่งหรือถัดไปไม่ชัดเจน กรุณากดเอง');s.submitted.add(q.fingerprint);await visible[0].click({timeout:5000});s.selected=null;return {ok:true};}
 function matching(bank,q){let m=bank.filter(x=>norm(x.question)===norm(q.question));if(m.length>1){const c=q.choices.map(norm).sort().join('|');m=m.filter(x=>x.choices?.map(norm).sort().join('|')===c);}if(m.length!==1||m[0].ambiguous)return null;const indexes=q.choices.map((c,i)=>norm(c)===norm(m[0].answer)?i:-1).filter(i=>i>=0);return indexes.length===1?{record:m[0],choice:indexes[0]+1}:null;}
-async function loop(s,g){try{while(s.auto&&!s.closed&&s.generation===g){await lock(s,async()=>{if(!s.auto||s.generation!==g)return;if(!await loggedIn(s))throw Error('ยังไม่พบล็อกอิน / หลุดล็อกอิน');const q=await quiz(s);if(q.completed){s.auto=false;s.state='COMPLETED';addLog(s,'จบบททดสอบที่เปิดอยู่');return;}if(!q.question||q.blocked)throw Error('ไม่พบคำถามชัดเจน หรือมี CAPTCHA');const answer=matching(s.bank,q);if(!answer)throw Error('ไม่พบเฉลยชัดเจน หรือข้อนี้กำกวม');s.current={question:q.question,answer:answer.record.answer};s.state='ANSWER_FOUND';addLog(s,'พบเฉลย: '+answer.record.answer);await sleep(900);if(!s.auto||s.generation!==g)return;await select(s,{choice_number:answer.choice,fingerprint:q.fingerprint});if(!s.auto||s.generation!==g)return;await next(s,{fingerprint:q.fingerprint});s.answered++;s.state='NEXT_QUESTION';addLog(s,'ส่งคำสั่งแล้ว '+s.answered+' ข้อ');});await sleep(1800);if(s.auto&&s.selected===null){const q=await lock(s,()=>quiz(s));if(s.acted.has(q.fingerprint)){s.auto=false;s.state='PAUSED';addLog(s,'หน้าจอยังเป็นข้อเดิม กรุณาตรวจผลหรือกดถัดไปในหน้าล็อกอิน');}}}}catch(e){s.auto=false;s.state='PAUSED';addLog(s,e.message);} }
-function status(s){return {auto:s.auto,state:s.state,answered:s.answered,logs:s.logs,current:s.current||null};}
-function liveView(s,req){return {sessionId:s.id,pending:false,liveUrl:(process.env.PUBLIC_WORKER_URL||'https://'+req.headers.host)+'/live/'+s.id+'#'+s.viewKey,interactive:true};}
+async function prepareQuiz(s){
+ s.state='OPENING_QUIZ';
+ if(new URL(s.page.url()).pathname.includes('/auth/'))await s.page.goto(START,{waitUntil:'commit',timeout:20000});
+ const until=Date.now()+25000;
+ while(Date.now()<until){
+  if(!await loggedIn(s))throw Error('ไม่พบการล็อกอิน Garena ในเบราว์เซอร์');
+  const q=await quiz(s);if(q.blocked)throw Error('Garena ต้องการยืนยันเพิ่มเติม ระบบหยุดการทำงาน');if(q.error)throw Error(q.error);if(q.completed||q.question&&q.choices.length>=2)return q;
+  const path=new URL(s.page.url()).pathname;
+  if(/^\/chapter\/\d+$/.test(path)){
+   const quizButton=s.page.getByRole('button',{name:/^(แบบทดสอบ|ทำแบบทดสอบ|เริ่มแบบทดสอบ|quiz|start quiz)$/i});
+   const candidates=[];for(const e of await quizButton.all())if(await e.isVisible()&&await e.isEnabled())candidates.push(e);
+   if(candidates.length===1){await candidates[0].click({timeout:5000});await sleep(400);continue;}
+  }else if(path==='/'){
+   // Read only rendered chapter cards. Never inspect account tokens or private application state.
+   const entry=await s.page.evaluate(()=>{
+    const visible=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&getComputedStyle(e).visibility!=='hidden';};
+    for(const bottom of document.querySelectorAll('.bottom')){
+     if(bottom.querySelector('.bottom__completed'))continue;
+     const button=[...bottom.querySelectorAll('button')].find(e=>visible(e)&&!e.disabled&&!e.classList.contains('lock')&&/^(start learning|เริ่มเรียน|เริ่มเรียนรู้)$/i.test(e.textContent.trim()));
+     if(button){button.setAttribute('data-rov-run-entry','chapter');return {title:bottom.querySelector('h2')?.textContent?.trim()||'บททดสอบ'};}
+    }
+    return null;
+   });
+   if(entry){s.chapter=entry.title;addLog(s,'เปิดบท: '+entry.title);await s.page.locator('[data-rov-run-entry="chapter"]').click({timeout:5000});await sleep(400);continue;}
+  }
+  await sleep(500);
+ }
+ throw Error('RoV Academy ไม่แสดงบททดสอบที่พร้อมทำ จึงยังเริ่มตอบไม่ได้');
+}
+async function transition(s,fingerprint,g){
+ const until=Date.now()+15000;
+ while(Date.now()<until){
+  if(!s.auto||s.generation!==g)return null;
+  const q=await quiz(s);if(q.error)throw Error(q.error);if(q.blocked)throw Error('Garena ต้องการยืนยันเพิ่มเติม ระบบหยุดการทำงาน');
+  if(q.completed||q.question&&q.fingerprint!==fingerprint)return q;
+  await sleep(400);
+ }
+ throw Error('ส่งคำตอบแล้ว แต่ RoV Academy ยังไม่แสดงข้อถัดไปหรือผลสำเร็จ ระบบหยุดเพื่อไม่ส่งซ้ำ');
+}
+async function loop(s,g){
+ try{while(s.auto&&!s.closed&&s.generation===g){
+  await lock(s,async()=>{
+   if(!s.auto||s.generation!==g)return;
+   if(!await loggedIn(s))throw Error('Garena หลุดล็อกอิน ระบบหยุดการทำงาน');
+   const q=await quiz(s);
+   if(q.error)throw Error(q.error);
+   if(q.completed){s.auto=false;s.state='COMPLETED';s.completedAt=Date.now();s.aiJob=null;addLog(s,'เสร็จแล้ว: RoV Academy แสดงผลผ่านบททดสอบ');return;}
+   if(!q.question||q.blocked)throw Error('อ่านคำถามจาก RoV Academy ไม่สำเร็จ');
+   let answer=s.allowAI?null:matching(s.bank,q);
+   if(answer)answer={answer:answer.record.answer,choice_number:answer.choice,source:'bank',evidence:answer.record.evidence||'คลังเฉลย'};
+   if(!answer&&s.aiResult?.fingerprint===q.fingerprint){answer=s.aiResult.answer;s.aiResult=null;}
+   if(!answer){
+    if(!s.allowAI)throw Error('ไม่พบเฉลยที่ตรง และยังไม่ได้ตั้งค่า Gemini');
+    if(!s.aiJob||s.aiJob.question.fingerprint!==q.fingerprint)s.aiJob={generation:g,question:{question:q.question,choices:q.choices,fingerprint:q.fingerprint},lease:null};
+    s.current={question:q.question,choices:q.choices,answer:null,source:null};s.state='ANALYZING';return;
+   }
+   s.aiJob=null;s.current={question:q.question,choices:q.choices,answer:answer.answer,choice_number:answer.choice_number,source:answer.source,evidence:answer.evidence,submitted:false};
+   s.state='ANSWER_FOUND';addLog(s,'พบคำตอบจาก '+(answer.source==='gemini'?'Gemini':'คลังเฉลย')+': '+answer.answer);
+   if(!s.auto||s.generation!==g)return;
+   if(s.selected!==q.fingerprint)await select(s,{choice_number:answer.choice_number,fingerprint:q.fingerprint});
+   if(!s.auto||s.generation!==g)return;
+   s.state='SUBMITTING';await next(s,{fingerprint:q.fingerprint});
+   const changed=await transition(s,q.fingerprint,g);if(!changed)return;
+   s.answered++;s.current.submitted=true;s.history.push({...s.current,time:Date.now()});s.history=s.history.slice(-30);addLog(s,'ยืนยันการทำข้อที่ '+s.answered+' แล้ว');
+   if(changed.completed){s.auto=false;s.state='COMPLETED';s.completedAt=Date.now();addLog(s,'เสร็จแล้ว: RoV Academy แสดงผลผ่านบททดสอบ');}else s.state='RUNNING';
+  });
+  if(s.auto)await sleep(700);
+ }}catch(e){if(s.generation!==g)return;s.auto=false;s.state='PAUSED';s.error=String(e.message||'ตอบคำถามไม่สำเร็จ').slice(0,350);s.aiJob=null;addLog(s,'ระบบหยุดการตอบ โปรดตรวจข้อผิดพลาด');}
+}
+function status(s){return {loggedIn:s.loggedIn===true,auto:s.auto,state:s.state,answered:s.answered,logs:s.logs,current:s.current||null,history:s.history||[],chapter:s.chapter||null,completedAt:s.completedAt||null,error:s.error||null,generation:s.generation,aiJob:s.aiJob?{generation:s.aiJob.generation,question:s.aiJob.question,claimed:!!s.aiJob.lease&&s.aiJob.lease.expiresAt>Date.now()}:null};}
+function connectionView(s){return {sessionId:s.id,pending:false,connected:true};}
 async function createBrowser(id,questions){let browser;try{
  browser=await chromium.launch({headless:true,args:['--no-sandbox','--disable-dev-shm-usage'],timeout:45000});
  const context=await browser.newContext({viewport:{width:412,height:820}});const page=await context.newPage();
- const s={id,browser,context,page,viewKey:crypto.randomBytes(32).toString('base64url'),used:Date.now(),auto:false,closed:false,generation:0,bank:Array.isArray(questions)?questions.slice(0,1500):[],selectors:{question:process.env.QUESTION_SELECTOR||'.question',choice:process.env.CHOICE_SELECTOR||'.item:has(.itemchoice)'},queue:Promise.resolve(),acted:new Set(),submitted:new Set(),selected:null,logs:[],state:'CREATED',answered:0};
+ const s={id,browser,context,page,used:Date.now(),auto:false,closed:false,generation:0,bank:Array.isArray(questions)?questions.slice(0,1500):[],selectors:{question:process.env.QUESTION_SELECTOR||'.question',choice:process.env.CHOICE_SELECTOR||'.item:has(.itemchoice)'},queue:Promise.resolve(),acted:new Set(),submitted:new Set(),selected:null,logs:[],state:'CREATED',loggedIn:false,answered:0,history:[],aiJob:null,aiResult:null,error:null,allowAI:false};
  page.setDefaultTimeout(7000);context.on('page',p=>{s.page=p;p.setDefaultTimeout(7000);p.on('close',()=>{const remaining=context.pages().filter(x=>!x.isClosed());if(remaining.length)s.page=remaining[remaining.length-1];});});
  await context.route('**/*',route=>{const r=route.request();if(r.isNavigationRequest()&&r.frame()===s.page.mainFrame()&&(!safeHost(r.url())||s.enteringCredentials&&!credentialHost(r.url())&&new URL(r.url()).hostname!=='academy.rov.in.th'))return route.abort();return route.continue();});
  if(cancelledCreations.has(id)){await browser.close().catch(()=>{});return;}
@@ -166,7 +213,7 @@ async function createBrowser(id,questions){let browser;try{
 }
 app.post('/sessions',wrap(async(req,res)=>{
  const id=req.body.requestId||crypto.randomUUID();if(typeof id!=='string'||! /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))throw Error('Invalid requestId');
- const existing=sessions.get(id);if(existing){existing.used=Date.now();return res.json(liveView(existing,req));}
+ const existing=sessions.get(id);if(existing){existing.used=Date.now();return res.json(connectionView(existing));}
  if(failedCreations.has(id))throw Error(failedCreations.get(id));
  if(creating.has(id))return res.status(202).json({sessionId:id,pending:true,state:'CREATING'});
  if(sessions.size+creating.size>=MAX)return res.status(429).json({error:'มีเบราว์เซอร์ใช้งานอยู่ กรุณาปิดเซสชันเดิมก่อน'});
@@ -175,39 +222,50 @@ app.post('/sessions',wrap(async(req,res)=>{
  return res.status(202).json({sessionId:id,pending:true,state:'CREATING'});
 }));
 app.post('/sessions/:id/start',wrap(async(req,res)=>{const s=find(req);if(s.state!=='CREATED')return res.json({ok:true});if(!s.startPromise)s.startPromise=lock(s,()=>s.page.goto(START,{waitUntil:'commit',timeout:20000})).then(()=>{s.state='WAITING_LOGIN';}).catch(e=>{s.startPromise=null;throw e;});await s.startPromise;res.json({ok:true});}));
-app.get('/sessions/:id/live',wrap(async(req,res)=>{if(creating.has(req.params.id))return res.status(202).json({pending:true,state:'CREATING'});if(failedCreations.has(req.params.id))throw Error(failedCreations.get(req.params.id));res.json(liveView(find(req),req));}));
 app.get('/sessions/:id/login-status',wrap(async(req,res)=>{if(creating.has(req.params.id))return res.status(202).json({loggedIn:false,pending:true,state:'CREATING',auto:false,answered:0});const s=find(req);res.json({loggedIn:await lock(s,()=>loggedIn(s)),pending:false,...status(s)});}));
-app.post('/sessions/:id/prepare-login',wrap(async(req,res)=>{const s=find(req);if(s.auto)throw Error('หยุดออโต้ก่อนล็อกอิน');res.json({...await lock(s,()=>prepareLogin(s)),...liveView(s,req)});}));
 app.post('/sessions/:id/credentials',async(req,res)=>{
  try{
   if(typeof req.body.username!=='string'||!req.body.username.trim()||req.body.username.length>150||typeof req.body.password!=='string'||!req.body.password||req.body.password.length>1024)return res.status(400).json({error:'กรอกบัญชีและรหัสผ่านให้ครบ'});
-  const s=find(req);if(s.auto)return res.status(409).json({error:'หยุดออโต้ก่อนล็อกอิน'});
-  res.json({...await lock(s,()=>enterCredentials(s,req.body)),...liveView(s,req)});
+  const s=find(req);if(s.auto)return res.status(409).json({error:'หยุดการตอบคำถามก่อนล็อกอินใหม่'});
+  const result=await lock(s,()=>enterCredentials(s,req.body));
+  res.status(result.loggedIn?200:401).json({...result,...connectionView(s),error:result.loggedIn?undefined:result.message});
  }catch{res.status(409).json({error:'ไม่พบเซสชัน กรุณาสร้างใหม่'});}
- finally{req.body.username='';req.body.password='';}
+ finally{if(req.body&&typeof req.body==='object'){req.body.username='';req.body.password='';}}
 });
 app.get('/sessions/:id/question',wrap(async(req,res)=>{const s=find(req);if(!await lock(s,()=>loggedIn(s)))throw Error('ยังไม่พบล็อกอิน Garena');res.json(await lock(s,()=>quiz(s)));}));
 app.post('/sessions/:id/select',wrap(async(req,res)=>{const s=find(req);if(s.auto)throw Error('ออโต้กำลังทำงาน');res.json(await lock(s,()=>select(s,req.body)));}));
 app.post('/sessions/:id/next',wrap(async(req,res)=>{const s=find(req);if(s.auto)throw Error('ออโต้กำลังทำงาน');res.json(await lock(s,()=>next(s,req.body)));}));
-app.post('/sessions/:id/auto',wrap(async(req,res)=>{const s=find(req);if(s.auto)return res.json(status(s));if(!Array.isArray(req.body.questions)||req.body.questions.length>1500)throw Error('คลังเฉลยไม่ถูกต้อง');s.bank=req.body.questions.filter(x=>typeof x.question==='string'&&typeof x.answer==='string');if(!s.bank.length)throw Error('ไม่มีเฉลย');if(!await lock(s,()=>loggedIn(s)))throw Error('ยังไม่พบล็อกอิน Garena');s.auto=true;s.generation++;s.state='RUNNING';addLog(s,'เริ่มออโต้จากคลังเฉลย');res.json(status(s));void loop(s,s.generation);}));
+app.post('/sessions/:id/auto',wrap(async(req,res)=>{
+ const s=find(req);
+ const started=await lock(s,async()=>{
+  if(s.auto)return false;
+  if(!Array.isArray(req.body.questions)||req.body.questions.length>1500)throw Error('คลังเฉลยไม่ถูกต้อง');
+  s.bank=req.body.questions.filter(x=>typeof x.question==='string'&&typeof x.answer==='string');s.allowAI=req.body.allowAI===true;
+  if(!s.bank.length&&!s.allowAI)throw Error('ยังไม่มีคลังเฉลยหรือ Gemini');
+  if(!await loggedIn(s))throw Error('ยังไม่พบล็อกอิน Garena');
+  const q=await prepareQuiz(s);if(q.completed){s.state='COMPLETED';return false;}
+  s.auto=true;s.generation++;s.state='RUNNING';s.error=null;s.aiJob=null;s.aiResult=null;addLog(s,'เริ่มอ่านและตอบคำถามอัตโนมัติ');return true;
+ });
+ res.json(status(s));if(started)void loop(s,s.generation);
+}));
+app.post('/sessions/:id/ai-claim',wrap(async(req,res)=>{
+ const s=find(req);const job=s.aiJob;
+ if(!s.auto||!job||job.generation!==req.body.generation||job.question.fingerprint!==req.body.fingerprint||job.lease&&job.lease.expiresAt>Date.now())return res.json({claimed:false});
+ job.lease={id:crypto.randomUUID(),expiresAt:Date.now()+90000};res.json({claimed:true,lease:job.lease.id,generation:job.generation,question:job.question});
+}));
+app.post('/sessions/:id/ai-answer',wrap(async(req,res)=>{
+ const s=find(req),job=s.aiJob,b=req.body;
+ if(!s.auto||!job||s.generation!==b.generation||job.generation!==b.generation||job.lease?.id!==b.lease||job.lease.expiresAt<Date.now())return res.json({accepted:false});
+ if(b.error){s.auto=false;s.state='PAUSED';s.error=String(b.error).slice(0,350);s.aiJob=null;addLog(s,'AI วิเคราะห์ไม่สำเร็จ ระบบหยุดการตอบ');return res.json({accepted:false});}
+ const q=await lock(s,()=>quiz(s));if(!s.auto||s.generation!==b.generation||s.aiJob!==job)return res.json({accepted:false});if(q.fingerprint!==job.question.fingerprint){s.aiJob=null;return res.json({accepted:false});}
+ const a=b.answer;
+ if(!Number.isInteger(a?.choice_number)||a.choice_number<1||a.choice_number>q.choices.length||norm(a.answer)!==norm(q.choices[a.choice_number-1])||!['bank','gemini'].includes(a.source))throw Error('ผล AI ไม่ตรงกับตัวเลือก');
+ s.aiResult={fingerprint:q.fingerprint,answer:{answer:q.choices[a.choice_number-1],choice_number:a.choice_number,source:a.source,evidence:String(a.evidence||'').slice(0,500)}};s.aiJob=null;res.json({accepted:true});
+}));
 app.get('/sessions/:id/auto',wrap(async(req,res)=>res.json(status(find(req)))));
-app.post('/sessions/:id/pause',wrap(async(req,res)=>{const s=find(req);s.auto=false;s.generation++;s.state='PAUSED';addLog(s,'หยุดออโต้ตามคำขอ');res.json(status(s));}));
+app.post('/sessions/:id/pause',wrap(async(req,res)=>{const s=find(req);s.auto=false;s.generation++;s.state='PAUSED';s.aiJob=null;s.aiResult=null;addLog(s,'หยุดตามคำขอ');res.json(status(s));}));
 app.post('/sessions/:id/stop',wrap(async(req,res)=>{if(creating.has(req.params.id)){cancelledCreations.add(req.params.id);return res.json({ok:true});}const s=find(req);s.auto=false;s.generation++;s.closed=true;sessions.delete(s.id);await s.browser.close().catch(()=>{});res.json({ok:true});}));
 app.post('/diagnostics',wrap(async(req,res)=>{const browser=await chromium.launch({headless:true,args:['--no-sandbox','--disable-dev-shm-usage']});try{const page=await browser.newPage();await page.setContent('<h2>Which answer?</h2><label><input type="radio" name="q">A</label><label><input type="radio" name="q">B</label>');const s={page,bank:[{question:'Which answer?',choices:['A','B'],answer:'B'}],selectors:{}};const q=await quiz(s);if(q.question!=='Which answer?'||q.choices.join('|')!=='A|B')throw Error('Parser fixture failed');if(matching(s.bank,q)?.choice!==2)throw Error('Choice mapping failed');if(matching([{...s.bank[0],ambiguous:true}],q)!==null)throw Error('Ambiguous guard failed');if(await loggedIn(s))throw Error('Login guard failed');res.json({ok:true,checks:['chromium-launch','quiz-parser','choice-mapping','ambiguous-stop','login-not-inferred-from-url'],liveGarenaTested:false});}finally{await browser.close();}}));
 setInterval(()=>{for(const [id,s]of sessions)if(Date.now()-s.used>30*60*1000){s.auto=false;s.closed=true;sessions.delete(id);void s.browser.close().catch(()=>{});}},60000).unref();
 process.on('SIGTERM',()=>{for(const s of sessions.values()){s.auto=false;void s.browser.close();}setTimeout(()=>process.exit(),1000).unref();});
-const LIVE_HTML=`<!doctype html><html lang="th"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ล็อกอิน Garena · Browser Worker</title><style>body{margin:0;background:#131319;font:14px Arial;color:#eee6f5}header{padding:12px;background:#211c35;position:sticky;top:0;z-index:2}h1{font-size:18px;margin:0 0 8px}button,input{font:inherit;padding:11px;border:1px solid #695776;border-radius:9px}button{background:#554076;color:white;cursor:pointer}#screen{display:block;width:100%;max-width:412px;margin:auto;touch-action:none;cursor:crosshair}#controls{padding:12px;display:flex;gap:7px;flex-wrap:wrap;max-width:412px;margin:auto}input{width:190px}#msg{font-size:12px}p{line-height:1.5}</style><header><h1>หน้าจอ Garena</h1><div id="msg">กำลังเชื่อมหน้าจอ…</div><p>แตะหรือลากบนภาพเพื่อทำ CAPTCHA<br>กรอก OTP: แตะช่องบนภาพ แล้วส่งข้อความด้านล่าง</p><button id="pause">หยุดออโต้</button></header><img id="screen" alt="หน้าจอเบราว์เซอร์ Garena"><div id="controls"><label for="text">OTP / ข้อความ</label><input id="text" type="password" autocomplete="off" placeholder="ข้อความส่งไปช่องที่แตะ"><button id="send">ส่งข้อความ</button><button data-key="Tab">Tab</button><button data-key="Enter">Enter</button><button data-key="Control+A">เลือกทั้งหมด</button><button data-key="Backspace">ลบ</button><button data-delta="-500">เลื่อนขึ้น</button><button data-delta="500">เลื่อนลง</button></div><script>
-const base=location.pathname,key=location.hash.slice(1),screen=document.getElementById('screen'),msg=document.getElementById('msg');history.replaceState(null,'',base);let running=true,loading=false,url=null;
-async function send(path,data){const r=await fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json','X-View-Key':key},body:JSON.stringify(data)});const d=await r.json();if(!r.ok)throw Error(d.error||'เชื่อมต่อไม่สำเร็จ');return d;}
-async function act(data){try{await send('/input',data);msg.textContent='ส่งคำสั่งแล้ว';}catch(e){msg.textContent=e.message;}}
-let points=[],pointer=null;
-function position(e){const r=screen.getBoundingClientRect();return {x:Math.max(0,Math.min(412,Math.round((e.clientX-r.left)*412/r.width))),y:Math.max(0,Math.min(820,Math.round((e.clientY-r.top)*820/r.height)))};}
-screen.onpointerdown=e=>{if(pointer!==null)return;e.preventDefault();pointer=e.pointerId;points=[position(e)];screen.setPointerCapture(pointer);};
-screen.onpointermove=e=>{if(e.pointerId!==pointer)return;const p=position(e);if(points.length<64)points.push(p);else points[63]=p;};
-screen.onpointerup=e=>{if(e.pointerId!==pointer)return;const p=position(e),first=points[0];if(points.length<64)points.push(p);else points[63]=p;pointer=null;if(Math.hypot(p.x-first.x,p.y-first.y)<5)act({kind:'click',...p});else act({kind:'drag',points});points=[];};
-screen.onpointercancel=()=>{pointer=null;points=[];};
-document.getElementById('send').onclick=()=>{const t=document.getElementById('text');const text=t.value;t.value='';act({kind:'text',text});};document.querySelectorAll('[data-key]').forEach(b=>b.onclick=()=>act({kind:'key',key:b.dataset.key}));document.querySelectorAll('[data-delta]').forEach(b=>b.onclick=()=>act({kind:'scroll',delta:Number(b.dataset.delta)}));document.getElementById('pause').onclick=()=>send('/pause',{}).then(()=>msg.textContent='หยุดออโต้แล้ว').catch(e=>msg.textContent=e.message);
-async function refresh(){if(!running||loading)return;loading=true;try{const r=await fetch(base+'/screen',{headers:{'X-View-Key':key}});if(!r.ok){const d=await r.json();throw Error(d.error);}const next=URL.createObjectURL(await r.blob());screen.src=next;if(url)URL.revokeObjectURL(url);url=next;}catch(e){msg.textContent=e.message;}finally{loading=false;}}
-send('/auth',{key}).then(()=>{msg.textContent='เชื่อมต่อแล้ว แตะหน้าจอเพื่อล็อกอิน';refresh();setInterval(refresh,1600);}).catch(e=>msg.textContent=e.message);addEventListener('pagehide',()=>{running=false;if(url)URL.revokeObjectURL(url);});
-</script></html>`;
-app.listen(PORT,'0.0.0.0',()=>console.log('Browser Worker v2.3 listening on '+PORT));
+app.listen(PORT,'0.0.0.0',()=>console.log('Browser Worker v2.4 listening on '+PORT));
