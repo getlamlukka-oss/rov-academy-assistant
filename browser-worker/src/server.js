@@ -4,17 +4,49 @@ import { chromium } from 'playwright';
 const app=express();app.disable('x-powered-by');app.set('trust proxy',1);app.use(express.json({limit:'1mb'}));
 const PORT=Number(process.env.PORT||10000),tokens=[process.env.BROWSER_WORKER_TOKEN,process.env.SITES_WORKER_TOKEN].filter(Boolean);
 const START='https://academy.rov.in.th/';const sessions=new Map(),creating=new Map(),failedCreations=new Map(),cancelledCreations=new Set();const MAX=Number(process.env.MAX_BROWSER_SESSIONS||1);
+const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const AUTH_STATE_MAX_BYTES=200000,AUTH_REFRESH_MS=10*60*1000;
+const AUTH_KEY=(()=>{const material=process.env.AUTH_STATE_ENCRYPTION_KEY||process.env.BROWSER_WORKER_TOKEN||process.env.SITES_WORKER_TOKEN;if(!material)return null;return crypto.createHash('sha256').update('rov-auth-state:v1\0').update(material).digest();})();
 const equal=(a,b)=>typeof a==='string'&&typeof b==='string'&&Buffer.byteLength(a)===Buffer.byteLength(b)&&crypto.timingSafeEqual(Buffer.from(a),Buffer.from(b));
 const hash=q=>crypto.createHash('sha256').update(JSON.stringify([q.question,q.choices])).digest('hex');
 const norm=v=>String(v||'').normalize('NFKC').toLowerCase().replace(/[\s\p{P}\p{S}]/gu,'');
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function safeHost(url){try{const u=new URL(url);return u.protocol==='https:'&&['rov.in.th','garena.com','garena.co.th','garena.in.th','garenanow.com','facebook.com'].some(h=>u.hostname===h||u.hostname.endsWith('.'+h));}catch{return false;}}
+function cookieHost(domain){const host=String(domain||'').replace(/^\./,'').toLowerCase();return ['rov.in.th','garena.com','garena.co.th','garena.in.th','garenanow.com'].some(h=>host===h||host.endsWith('.'+h));}
+function cleanCookies(cookies){
+ const now=Math.floor(Date.now()/1000),out=[];let bytes=0;
+ for(const c of Array.isArray(cookies)?cookies:[]){
+  if(!cookieHost(c.domain)||typeof c.name!=='string'||typeof c.value!=='string'||!c.name||c.name.length>256||c.value.length>8192||Number(c.expires)>0&&Number(c.expires)<=now)continue;
+  const item={name:c.name,value:c.value,domain:String(c.domain),path:typeof c.path==='string'&&c.path.startsWith('/')?c.path:'/',expires:Number.isFinite(Number(c.expires))?Number(c.expires):-1,httpOnly:c.httpOnly===true,secure:c.secure!==false,sameSite:['Strict','Lax','None'].includes(c.sameSite)?c.sameSite:'Lax'};
+  bytes+=Buffer.byteLength(JSON.stringify(item));if(bytes>128000||out.length>=80)throw Error('Cookie state exceeds safe limit');out.push(item);
+ }
+ return out;
+}
+function authAAD(profileId){return Buffer.from('rov-auth:v1:'+profileId);}
+function sealAuth(profileId,cookies){
+ if(!AUTH_KEY)throw Error('Encrypted login storage is not configured');
+ const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',AUTH_KEY,iv);cipher.setAAD(authAAD(profileId));
+ const encrypted=Buffer.concat([cipher.update(JSON.stringify({v:1,cookies:cleanCookies(cookies),savedAt:Date.now()}),'utf8'),cipher.final()]);
+ return ['v1',iv.toString('base64url'),cipher.getAuthTag().toString('base64url'),encrypted.toString('base64url')].join('.');
+}
+function openAuth(profileId,blob){
+ if(!AUTH_KEY||typeof blob!=='string'||Buffer.byteLength(blob)>AUTH_STATE_MAX_BYTES)throw Error('Invalid encrypted login state');
+ const parts=blob.split('.');if(parts.length!==4||parts[0]!=='v1')throw Error('Invalid encrypted login state');
+ const iv=Buffer.from(parts[1],'base64url'),tag=Buffer.from(parts[2],'base64url'),encrypted=Buffer.from(parts[3],'base64url');if(iv.length!==12||tag.length!==16||!encrypted.length)throw Error('Invalid encrypted login state');
+ const decipher=crypto.createDecipheriv('aes-256-gcm',AUTH_KEY,iv);decipher.setAAD(authAAD(profileId));decipher.setAuthTag(tag);
+ const payload=JSON.parse(Buffer.concat([decipher.update(encrypted),decipher.final()]).toString('utf8'));if(payload?.v!==1)throw Error('Invalid encrypted login state');
+ return {cookies:cleanCookies(payload.cookies),origins:[]};
+}
+async function exportAuth(s,force=false){
+ if(!AUTH_KEY||!s.profileId||!s.loggedIn||!force&&Date.now()-s.authExportedAt<AUTH_REFRESH_MS)return null;
+ const state=await s.context.storageState();const cookies=cleanCookies(state.cookies);if(!cookies.length)return null;s.authExportedAt=Date.now();return sealAuth(s.profileId,cookies);
+}
 function addLog(s,msg){s.logs.push({time:Date.now(),message:msg});s.logs=s.logs.slice(-40);}
 async function lock(s,fn){const prev=s.queue;s.queue=new Promise(r=>s.releaseQueue=r);const release=s.releaseQueue;await prev;try{if(s.closed)throw Error('เซสชันปิดแล้ว');return await fn();}finally{release();}}
 function find(req){const s=sessions.get(req.params.id);if(!s)throw Error('ไม่พบเซสชัน กรุณาสร้างใหม่');s.used=Date.now();return s;}
 const wrap=fn=>async(req,res)=>{try{await fn(req,res);}catch(e){res.status(409).json({error:e.message?.slice(0,220)||'Worker error'});}};
 app.use((req,res,next)=>{res.set({'Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff','Strict-Transport-Security':'max-age=31536000','Permissions-Policy':'camera=(), microphone=(), geolocation=(), payment=(), usb=()'});next();});
-app.get('/health',(_req,res)=>res.json({ok:true,version:'2.4.0',service:'rov-browser-worker',sessions:sessions.size,starting:creating.size,configured:tokens.length>0,capabilities:{idempotentSessions:true,credentialLogin:true,loginReadiness:true,automaticFlow:true,aiJobs:true}}));
+app.get('/health',(_req,res)=>res.json({ok:true,version:'2.5.0',service:'rov-browser-worker',sessions:sessions.size,starting:creating.size,configured:tokens.length>0&&!!AUTH_KEY,capabilities:{idempotentSessions:true,credentialLogin:true,loginReadiness:true,automaticFlow:true,aiJobs:true,encryptedCookieSessions:!!AUTH_KEY}}));
 app.use((req,res,next)=>{if(!tokens.length)return res.status(503).json({error:'Worker token not configured'});if(!tokens.some(t=>equal(req.headers.authorization,'Bearer '+t)))return res.status(401).json({error:'Unauthorized'});next();});
 // Check the authenticated profile/logout UI rendered by Academy (mobile menu may be collapsed). Never read login tokens or infer login from URL.
 async function loggedIn(s){
@@ -199,11 +231,13 @@ async function loop(s,g){
  }}catch(e){if(s.generation!==g)return;s.auto=false;s.state='PAUSED';s.error=String(e.message||'ตอบคำถามไม่สำเร็จ').slice(0,350);s.aiJob=null;addLog(s,'ระบบหยุดการตอบ โปรดตรวจข้อผิดพลาด');}
 }
 function status(s){return {loggedIn:s.loggedIn===true,auto:s.auto,state:s.state,answered:s.answered,logs:s.logs,current:s.current||null,history:s.history||[],chapter:s.chapter||null,completedAt:s.completedAt||null,error:s.error||null,generation:s.generation,aiJob:s.aiJob?{generation:s.aiJob.generation,question:s.aiJob.question,claimed:!!s.aiJob.lease&&s.aiJob.lease.expiresAt>Date.now()}:null};}
-function connectionView(s){return {sessionId:s.id,pending:false,connected:true};}
-async function createBrowser(id,questions){let browser;try{
+function connectionView(s){return {sessionId:s.id,pending:false,connected:true,restoredLogin:s.restoredAuth===true};}
+async function createBrowser(id,questions,profileId,authState){let browser;try{
+ let storageState,authStateInvalid=false;
+ if(authState){try{storageState=openAuth(profileId,authState);}catch{authStateInvalid=true;}}
  browser=await chromium.launch({headless:true,args:['--no-sandbox','--disable-dev-shm-usage'],timeout:45000});
- const context=await browser.newContext({viewport:{width:412,height:820}});const page=await context.newPage();
- const s={id,browser,context,page,used:Date.now(),auto:false,closed:false,generation:0,bank:Array.isArray(questions)?questions.slice(0,1500):[],selectors:{question:process.env.QUESTION_SELECTOR||'.question',choice:process.env.CHOICE_SELECTOR||'.item:has(.itemchoice)'},queue:Promise.resolve(),acted:new Set(),submitted:new Set(),selected:null,logs:[],state:'CREATED',loggedIn:false,answered:0,history:[],aiJob:null,aiResult:null,error:null,allowAI:false};
+ const context=await browser.newContext({viewport:{width:412,height:820},...(storageState?{storageState}:{})});const page=await context.newPage();
+ const s={id,profileId,browser,context,page,used:Date.now(),auto:false,closed:false,generation:0,bank:Array.isArray(questions)?questions.slice(0,1500):[],selectors:{question:process.env.QUESTION_SELECTOR||'.question',choice:process.env.CHOICE_SELECTOR||'.item:has(.itemchoice)'},queue:Promise.resolve(),acted:new Set(),submitted:new Set(),selected:null,logs:[],state:'CREATED',loggedIn:false,answered:0,history:[],aiJob:null,aiResult:null,error:null,allowAI:false,restoredAuth:!!storageState,authStateInvalid,authExportedAt:0,startedAt:0};
  page.setDefaultTimeout(7000);context.on('page',p=>{s.page=p;p.setDefaultTimeout(7000);p.on('close',()=>{const remaining=context.pages().filter(x=>!x.isClosed());if(remaining.length)s.page=remaining[remaining.length-1];});});
  await context.route('**/*',route=>{const r=route.request();if(r.isNavigationRequest()&&r.frame()===s.page.mainFrame()&&(!safeHost(r.url())||s.enteringCredentials&&!credentialHost(r.url())&&new URL(r.url()).hostname!=='academy.rov.in.th'))return route.abort();return route.continue();});
  if(cancelledCreations.has(id)){await browser.close().catch(()=>{});return;}
@@ -212,23 +246,25 @@ async function createBrowser(id,questions){let browser;try{
  finally{creating.delete(id);cancelledCreations.delete(id);}
 }
 app.post('/sessions',wrap(async(req,res)=>{
- const id=req.body.requestId||crypto.randomUUID();if(typeof id!=='string'||! /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))throw Error('Invalid requestId');
+ const id=req.body.requestId||crypto.randomUUID(),profileId=req.body.profileId;if(typeof id!=='string'||!UUID.test(id))throw Error('Invalid requestId');
+ if(typeof profileId!=='string'||!UUID.test(profileId))throw Error('Invalid profileId');if(!AUTH_KEY)throw Error('Encrypted login storage is not configured');
+ if(req.body.authState!==undefined&&(typeof req.body.authState!=='string'||Buffer.byteLength(req.body.authState)>AUTH_STATE_MAX_BYTES))throw Error('Invalid encrypted login state');
  const existing=sessions.get(id);if(existing){existing.used=Date.now();return res.json(connectionView(existing));}
  if(failedCreations.has(id))throw Error(failedCreations.get(id));
  if(creating.has(id))return res.status(202).json({sessionId:id,pending:true,state:'CREATING'});
  if(sessions.size+creating.size>=MAX)return res.status(429).json({error:'มีเบราว์เซอร์ใช้งานอยู่ กรุณาปิดเซสชันเดิมก่อน'});
  // Reserve capacity synchronously; retries with the same requestId reuse the job.
- creating.set(id,true);void createBrowser(id,req.body.questions);
+ creating.set(id,true);void createBrowser(id,req.body.questions,profileId,req.body.authState);
  return res.status(202).json({sessionId:id,pending:true,state:'CREATING'});
 }));
-app.post('/sessions/:id/start',wrap(async(req,res)=>{const s=find(req);if(s.state!=='CREATED')return res.json({ok:true});if(!s.startPromise)s.startPromise=lock(s,()=>s.page.goto(START,{waitUntil:'commit',timeout:20000})).then(()=>{s.state='WAITING_LOGIN';}).catch(e=>{s.startPromise=null;throw e;});await s.startPromise;res.json({ok:true});}));
-app.get('/sessions/:id/login-status',wrap(async(req,res)=>{if(creating.has(req.params.id))return res.status(202).json({loggedIn:false,pending:true,state:'CREATING',auto:false,answered:0});const s=find(req);res.json({loggedIn:await lock(s,()=>loggedIn(s)),pending:false,...status(s)});}));
+app.post('/sessions/:id/start',wrap(async(req,res)=>{const s=find(req);if(s.state!=='CREATED')return res.json({ok:true});if(!s.startPromise)s.startPromise=lock(s,()=>s.page.goto(START,{waitUntil:'commit',timeout:20000})).then(()=>{s.state='WAITING_LOGIN';s.startedAt=Date.now();}).catch(e=>{s.startPromise=null;throw e;});await s.startPromise;res.json({ok:true});}));
+app.get('/sessions/:id/login-status',wrap(async(req,res)=>{if(creating.has(req.params.id))return res.status(202).json({loggedIn:false,pending:true,state:'CREATING',auto:false,answered:0});const s=find(req);const ok=await lock(s,()=>loggedIn(s));let authState=null,clearAuthState=false;if(ok)authState=await lock(s,()=>exportAuth(s));else if((s.restoredAuth||s.authStateInvalid)&&s.startedAt&&Date.now()-s.startedAt>20000){clearAuthState=true;s.restoredAuth=false;s.authStateInvalid=false;}res.json({loggedIn:ok,pending:false,...status(s),...(authState?{authState}:{}),...(clearAuthState?{clearAuthState:true}:{})});}));
 app.post('/sessions/:id/credentials',async(req,res)=>{
  try{
   if(typeof req.body.username!=='string'||!req.body.username.trim()||req.body.username.length>150||typeof req.body.password!=='string'||!req.body.password||req.body.password.length>1024)return res.status(400).json({error:'กรอกบัญชีและรหัสผ่านให้ครบ'});
   const s=find(req);if(s.auto)return res.status(409).json({error:'หยุดการตอบคำถามก่อนล็อกอินใหม่'});
-  const result=await lock(s,()=>enterCredentials(s,req.body));
-  res.status(result.loggedIn?200:401).json({...result,...connectionView(s),error:result.loggedIn?undefined:result.message});
+  const result=await lock(s,()=>enterCredentials(s,req.body));const authState=result.loggedIn?await lock(s,()=>exportAuth(s,true)):null;
+  res.status(result.loggedIn?200:401).json({...result,...connectionView(s),...(authState?{authState}:{}),...(result.loggedIn?{}:{clearAuthState:true}),error:result.loggedIn?undefined:result.message});
  }catch{res.status(409).json({error:'ไม่พบเซสชัน กรุณาสร้างใหม่'});}
  finally{if(req.body&&typeof req.body==='object'){req.body.username='';req.body.password='';}}
 });
@@ -264,8 +300,8 @@ app.post('/sessions/:id/ai-answer',wrap(async(req,res)=>{
 }));
 app.get('/sessions/:id/auto',wrap(async(req,res)=>res.json(status(find(req)))));
 app.post('/sessions/:id/pause',wrap(async(req,res)=>{const s=find(req);s.auto=false;s.generation++;s.state='PAUSED';s.aiJob=null;s.aiResult=null;addLog(s,'หยุดตามคำขอ');res.json(status(s));}));
-app.post('/sessions/:id/stop',wrap(async(req,res)=>{if(creating.has(req.params.id)){cancelledCreations.add(req.params.id);return res.json({ok:true});}const s=find(req);s.auto=false;s.generation++;s.closed=true;sessions.delete(s.id);await s.browser.close().catch(()=>{});res.json({ok:true});}));
+app.post('/sessions/:id/stop',wrap(async(req,res)=>{if(creating.has(req.params.id)){cancelledCreations.add(req.params.id);return res.json({ok:true,clearAuthState:true});}const s=find(req);s.auto=false;s.generation++;s.closed=true;sessions.delete(s.id);await s.browser.close().catch(()=>{});res.json({ok:true,clearAuthState:true});}));
 app.post('/diagnostics',wrap(async(req,res)=>{const browser=await chromium.launch({headless:true,args:['--no-sandbox','--disable-dev-shm-usage']});try{const page=await browser.newPage();await page.setContent('<h2>Which answer?</h2><label><input type="radio" name="q">A</label><label><input type="radio" name="q">B</label>');const s={page,bank:[{question:'Which answer?',choices:['A','B'],answer:'B'}],selectors:{}};const q=await quiz(s);if(q.question!=='Which answer?'||q.choices.join('|')!=='A|B')throw Error('Parser fixture failed');if(matching(s.bank,q)?.choice!==2)throw Error('Choice mapping failed');if(matching([{...s.bank[0],ambiguous:true}],q)!==null)throw Error('Ambiguous guard failed');if(await loggedIn(s))throw Error('Login guard failed');res.json({ok:true,checks:['chromium-launch','quiz-parser','choice-mapping','ambiguous-stop','login-not-inferred-from-url'],liveGarenaTested:false});}finally{await browser.close();}}));
 setInterval(()=>{for(const [id,s]of sessions)if(Date.now()-s.used>30*60*1000){s.auto=false;s.closed=true;sessions.delete(id);void s.browser.close().catch(()=>{});}},60000).unref();
 process.on('SIGTERM',()=>{for(const s of sessions.values()){s.auto=false;void s.browser.close();}setTimeout(()=>process.exit(),1000).unref();});
-app.listen(PORT,'0.0.0.0',()=>console.log('Browser Worker v2.4 listening on '+PORT));
+app.listen(PORT,'0.0.0.0',()=>console.log('Browser Worker v2.5 listening on '+PORT));
