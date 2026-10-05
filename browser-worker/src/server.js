@@ -14,7 +14,7 @@ async function lock(s,fn){const prev=s.queue;s.queue=new Promise(r=>s.releaseQue
 function find(req){const s=sessions.get(req.params.id);if(!s)throw Error('ไม่พบเซสชัน กรุณาสร้างใหม่');s.used=Date.now();return s;}
 const wrap=fn=>async(req,res)=>{try{await fn(req,res);}catch(e){res.status(409).json({error:e.message?.slice(0,220)||'Worker error'});}};
 app.use((req,res,next)=>{res.set({'Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff'});next();});
-app.get('/health',(_req,res)=>res.json({ok:true,version:'2.1.0',service:'rov-browser-worker',sessions:sessions.size,starting:creating.size,configured:tokens.length>0,capabilities:{idempotentSessions:true}}));
+app.get('/health',(_req,res)=>res.json({ok:true,version:'2.2.0',service:'rov-browser-worker',sessions:sessions.size,starting:creating.size,configured:tokens.length>0,capabilities:{idempotentSessions:true,credentialLogin:true}}));
 // A session-specific view capability is exchanged for an HttpOnly cookie. It never exposes the service token.
 app.get('/live/:id',wrap(async(req,res)=>{find(req);res.type('html').send(LIVE_HTML);}));
 app.post('/live/:id/auth',wrap(async(req,res)=>{const s=find(req);if(!equal(req.body.key,s.viewKey))return res.status(401).json({error:'ลิงก์หมดอายุหรือไม่ถูกต้อง'});const name='view_'+s.id.replaceAll('-','');res.cookie(name,s.viewKey,{httpOnly:true,secure:process.env.NODE_ENV!=='test',sameSite:'strict',path:'/live/'+s.id,maxAge:30*60*1000});res.json({ok:true});}));
@@ -25,6 +25,39 @@ app.post('/live/:id/pause',liveAuth,wrap(async(req,res)=>{const s=find(req);s.au
 app.use((req,res,next)=>{if(!tokens.length)return res.status(503).json({error:'Worker token not configured'});if(!tokens.some(t=>equal(req.headers.authorization,'Bearer '+t)))return res.status(401).json({error:'Unauthorized'});next();});
 // Check the authenticated profile/logout UI rendered by Academy (mobile menu may be collapsed). Never read login tokens or infer login from URL.
 async function loggedIn(s){if(new URL(s.page.url()).hostname!=='academy.rov.in.th')return false;return s.page.evaluate(()=>{const visible=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&getComputedStyle(e).visibility!=='hidden'};const els=[...document.querySelectorAll('button,a,[role=button]')].filter(visible);const logout=e=>/^(ออกจากระบบ|ล็อกเอาท์|logout|log out)$/i.test((e.textContent||'').trim());const profile=document.querySelector('.menuright .user .name');const menuLabels=[...document.querySelectorAll('.menuright span,.menuright [role=button]')];return els.some(logout)||!!profile?.textContent?.trim()&&menuLabels.some(logout);});}
+// Academy's published OAuth configuration: app 100055, Garena platform 1, its own callback.
+const GARENA_LOGIN='https://100055.connect.garena.com/oauth/login?response_type=code&client_id=100055&redirect_uri=https%3A%2F%2Facademy.rov.in.th%2Fauth%2Fcallback%2F&locale=th-TH&platform=1';
+function credentialHost(url){try{const u=new URL(url);return u.protocol==='https:'&&['100055.connect.garena.com','sso.garena.com','auth.garena.com','account.garena.com'].includes(u.hostname);}catch{return false;}}
+async function enterCredentials(s,b){
+ if(s.auto)throw Error('Pause first');
+ if(await loggedIn(s))return {loggedIn:true,submitted:false};
+ let submitted=false;
+ s.enteringCredentials=true;
+ try{
+  if(!credentialHost(s.page.url()))await s.page.goto(GARENA_LOGIN,{waitUntil:'domcontentloaded',timeout:15000});
+  // Never fill on Academy, Facebook, a CAPTCHA frame or an unrecognized host.
+  const password=s.page.locator('input[type="password"]:visible');
+  await password.first().waitFor({state:'visible',timeout:8000});
+  const username=s.page.locator('input[type="text"]:visible,input[type="email"]:visible,input[type="tel"]:visible');
+  if(!credentialHost(s.page.url())||await password.count()!==1||await username.count()!==1)throw Error('Unrecognized login form');
+  const safeForm=await password.evaluate(e=>{const f=e.closest('form');const a=f?.getAttribute('action');if(!a)return true;const u=new URL(a,location.href);return u.protocol==='https:'&&['100055.connect.garena.com','sso.garena.com','auth.garena.com','account.garena.com'].includes(u.hostname);});
+  if(!safeForm)throw Error('Invalid form target');
+  await username.fill(b.username,{timeout:3000});
+  if(!credentialHost(s.page.url()))throw Error('Login page changed');
+  await password.fill(b.password,{timeout:3000});
+  b.username='';b.password='';
+  const button=s.page.locator('button[type="submit"]:visible,input[type="submit"]:visible');
+  if(!credentialHost(s.page.url())||await button.count()!==1)throw Error('Unrecognized submit button');
+  await button.click({timeout:3000});submitted=true;
+  const until=Date.now()+6000;
+  while(Date.now()<until){if(await loggedIn(s))return {loggedIn:true,submitted:true};await sleep(500);}
+  return {loggedIn:false,submitted:true,needsInteraction:true};
+ }finally{
+  s.enteringCredentials=false;b.username='';b.password='';
+  // Clear failed preparation. An official submitted form may need its password to finish CAPTCHA.
+  if(!submitted&&!s.page.isClosed()&&credentialHost(s.page.url()))await s.page.locator('input[type="password"]').fill('',{timeout:1000}).catch(()=>{});
+ }
+}
 async function quiz(s){const data=await s.page.evaluate(({bank,selectors})=>{
  const n=v=>String(v||'').normalize('NFKC').toLowerCase().replace(/[\s\p{P}\p{S}]/gu,'');
  const visible=e=>{const r=e.getBoundingClientRect();const style=getComputedStyle(e);return r.width>0&&r.height>0&&style.visibility!=='hidden'&&style.display!=='none';};
@@ -54,7 +87,7 @@ async function createBrowser(id,questions){let browser;try{
  const context=await browser.newContext({viewport:{width:412,height:820}});const page=await context.newPage();
  const s={id,browser,context,page,viewKey:crypto.randomBytes(32).toString('base64url'),used:Date.now(),auto:false,closed:false,generation:0,bank:Array.isArray(questions)?questions.slice(0,1500):[],selectors:{question:process.env.QUESTION_SELECTOR||'.question',choice:process.env.CHOICE_SELECTOR||'.item:has(.itemchoice)'},queue:Promise.resolve(),acted:new Set(),submitted:new Set(),selected:null,logs:[],state:'CREATED',answered:0};
  page.setDefaultTimeout(7000);context.on('page',p=>{s.page=p;p.setDefaultTimeout(7000);p.on('close',()=>{const remaining=context.pages().filter(x=>!x.isClosed());if(remaining.length)s.page=remaining[remaining.length-1];});});
- await context.route('**/*',route=>{const r=route.request();if(r.isNavigationRequest()&&r.frame()===s.page.mainFrame()&&!safeHost(r.url()))return route.abort();return route.continue();});
+ await context.route('**/*',route=>{const r=route.request();if(r.isNavigationRequest()&&r.frame()===s.page.mainFrame()&&(!safeHost(r.url())||s.enteringCredentials&&!credentialHost(r.url())&&new URL(r.url()).hostname!=='academy.rov.in.th'))return route.abort();return route.continue();});
  if(cancelledCreations.has(id)){await browser.close().catch(()=>{});return;}
  sessions.set(id,s);
  }catch(e){if(browser)await browser.close().catch(()=>{});if(!cancelledCreations.has(id)){failedCreations.set(id,'เบราว์เซอร์เริ่มไม่สำเร็จ กรุณาสร้างเซสชันใหม่');setTimeout(()=>failedCreations.delete(id),5*60*1000).unref();console.error('Browser creation failed: '+String(e.message).slice(0,180));}}
@@ -73,6 +106,14 @@ app.post('/sessions',wrap(async(req,res)=>{
 app.post('/sessions/:id/start',wrap(async(req,res)=>{const s=find(req);if(s.state!=='CREATED')return res.json({ok:true});if(!s.startPromise)s.startPromise=lock(s,()=>s.page.goto(START,{waitUntil:'commit',timeout:20000})).then(()=>{s.state='WAITING_LOGIN';}).catch(e=>{s.startPromise=null;throw e;});await s.startPromise;res.json({ok:true});}));
 app.get('/sessions/:id/live',wrap(async(req,res)=>{if(creating.has(req.params.id))return res.status(202).json({pending:true,state:'CREATING'});if(failedCreations.has(req.params.id))throw Error(failedCreations.get(req.params.id));res.json(liveView(find(req),req));}));
 app.get('/sessions/:id/login-status',wrap(async(req,res)=>{if(creating.has(req.params.id))return res.status(202).json({loggedIn:false,pending:true,state:'CREATING',auto:false,answered:0});const s=find(req);res.json({loggedIn:await lock(s,()=>loggedIn(s)),pending:false,...status(s)});}));
+app.post('/sessions/:id/credentials',async(req,res)=>{
+ try{
+  if(typeof req.body.username!=='string'||!req.body.username.trim()||req.body.username.length>150||typeof req.body.password!=='string'||!req.body.password||req.body.password.length>1024)return res.status(400).json({error:'กรอกบัญชีและรหัสผ่านให้ครบ'});
+  const s=find(req);if(s.auto)return res.status(409).json({error:'หยุดออโต้ก่อนล็อกอิน'});
+  res.json(await lock(s,()=>enterCredentials(s,req.body)));
+ }catch{res.status(409).json({error:'กรอกบัญชีในหน้า Garena ไม่สำเร็จ กรุณาเปิดหน้าจอเพื่อตรวจ CAPTCHA / OTP หรือรูปแบบหน้าล็อกอิน'});}
+ finally{req.body.username='';req.body.password='';}
+});
 app.get('/sessions/:id/question',wrap(async(req,res)=>{const s=find(req);if(!await lock(s,()=>loggedIn(s)))throw Error('ยังไม่พบล็อกอิน Garena');res.json(await lock(s,()=>quiz(s)));}));
 app.post('/sessions/:id/select',wrap(async(req,res)=>{const s=find(req);if(s.auto)throw Error('ออโต้กำลังทำงาน');res.json(await lock(s,()=>select(s,req.body)));}));
 app.post('/sessions/:id/next',wrap(async(req,res)=>{const s=find(req);if(s.auto)throw Error('ออโต้กำลังทำงาน');res.json(await lock(s,()=>next(s,req.body)));}));
