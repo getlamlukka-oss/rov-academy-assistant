@@ -1,1 +1,0 @@
-export function getClientId(){let x=localStorage.getItem('rov-client-id');if(!x){x=crypto.randomUUID();localStorage.setItem('rov-client-id',x)}return x}export function loadSettings<T>(d:T):T{try{return{...d,...JSON.parse(localStorage.getItem('rov-settings')||'{}')}}catch{return d}}export function saveSettings(x:unknown){localStorage.setItem('rov-settings',JSON.stringify(x))}

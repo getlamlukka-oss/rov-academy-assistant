@@ -1,0 +1,17 @@
+# Dependency หลัก; ใช้ bcrypt ที่เข้ากับ Passlib และ python-jose ที่แพตช์แล้ว
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+sqlalchemy==2.0.36
+pydantic==2.9.2
+python-multipart==0.0.12
+pandas==2.2.3
+openpyxl==3.1.5
+celery==5.4.0
+redis==5.2.0
+playwright==1.48.0
+python-dotenv==1.0.1
+websockets==13.1
+httpx==0.27.2
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-jose[cryptography]==3.5.0
