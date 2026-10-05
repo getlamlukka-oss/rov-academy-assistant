@@ -22,28 +22,25 @@ function liveAuth(req,res,next){const s=sessions.get(req.params.id);const name='
 app.get('/live/:id/screen',liveAuth,wrap(async(req,res)=>{const s=find(req);const jpeg=await lock(s,()=>s.page.screenshot({type:'jpeg',quality:65,timeout:8000}));res.type('jpeg').send(jpeg);}));
 app.post('/live/:id/input',liveAuth,wrap(async(req,res)=>{const s=find(req);if(s.auto)return res.status(409).json({error:'หยุดออโต้ก่อนควบคุมหน้าจอ'});const b=req.body;await lock(s,async()=>{if(b.kind==='click'){if(!Number.isFinite(b.x)||!Number.isFinite(b.y)||b.x<0||b.x>412||b.y<0||b.y>820)throw Error('Invalid position');await s.page.mouse.click(b.x,b.y);}else if(b.kind==='drag'){if(!Array.isArray(b.points)||b.points.length<2||b.points.length>64||b.points.some(p=>!Number.isFinite(p.x)||!Number.isFinite(p.y)||p.x<0||p.x>412||p.y<0||p.y>820))throw Error('Invalid drag');await s.page.mouse.move(b.points[0].x,b.points[0].y);await s.page.mouse.down();try{for(const p of b.points.slice(1))await s.page.mouse.move(p.x,p.y);}finally{await s.page.mouse.up();}}else if(b.kind==='text'){await s.page.keyboard.insertText(String(b.text||'').slice(0,1000));}else if(b.kind==='key'){if(!['Enter','Tab','Backspace','Escape','Control+A'].includes(b.key))throw Error('Invalid key');await s.page.keyboard.press(b.key);}else if(b.kind==='scroll'){await s.page.mouse.wheel(0,Number(b.delta)>0?500:-500);}else throw Error('Invalid input');});res.json({ok:true});}));
 app.post('/live/:id/pause',liveAuth,wrap(async(req,res)=>{const s=find(req);s.auto=false;s.generation++;addLog(s,'หยุดออโต้จากหน้าล็อกอิน');res.json({ok:true});}));
-// Expiring support audit: site authorization is added only to this exact owned Site.
-app.post('/diagnostics/site',async(req,res)=>{
+// Expiring static layout audit. It never connects to the private Site and accepts no Site credentials.
+app.post('/diagnostics/layout',async(req,res)=>{
  if(Date.now()>Number(process.env.DIAGNOSTICS_EXPIRES_AT||0)||!process.env.DIAGNOSTICS_TOKEN||!equal(req.headers.authorization,'Bearer '+process.env.DIAGNOSTICS_TOKEN))return res.status(401).json({error:'Unauthorized'});
- const origin='https://rov-academy-sites-v2.getlamlukka.chatgpt.site';let browser;
- if(typeof req.body.siteToken!=='string'||req.body.siteToken.length>2048)return res.status(400).json({error:'Invalid site authorization'});
+ let browser;
+ if(typeof req.body.markup!=='string'||typeof req.body.css!=='string'||req.body.markup.includes('<script'))return res.status(400).json({error:'Invalid static fixture'});
  try{
   browser=await chromium.launch({headless:true,args:['--no-sandbox','--disable-dev-shm-usage'],timeout:45000});
-  const context=await browser.newContext(),page=await context.newPage(),errors=[],failures=[];
-  await context.route('**/*',r=>{const u=new URL(r.request().url());return u.origin===origin?r.continue({headers:{...r.request().headers(),'OAI-Sites-Authorization':'Bearer '+req.body.siteToken}}):r.continue();});
-  page.on('pageerror',()=>errors.push('uncaught-page-error'));
-  page.on('console',m=>{if(m.type()==='error'&&/content security policy/i.test(m.text()))errors.push('CSP-blocked-resource');});
-  page.on('response',r=>{if(r.status()>=400){const u=new URL(r.url());failures.push({path:u.pathname,status:r.status()});}});
-  const navigation=await page.goto(origin,{waitUntil:'networkidle',timeout:45000}),views=[];
+  const context=await browser.newContext(),page=await context.newPage(),views=[];
+  await context.route('**/*',r=>r.abort());
+  await page.setContent('<html lang="th"><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>'+req.body.css+'</style></head><body>'+req.body.markup+'</body></html>');
   for(const [width,height]of [[375,667],[768,1024],[1440,900]]){
-   await page.setViewportSize({width,height});await page.waitForTimeout(150);
-   const layout=await page.evaluate(()=>({width:innerWidth,scrollWidth:document.documentElement.scrollWidth,overflow:document.documentElement.scrollWidth>innerWidth,unnamedButtons:[...document.querySelectorAll('button')].filter(e=>!e.getAttribute('aria-label')&&!e.textContent?.trim()).length,missingAlt:document.querySelectorAll('img:not([alt])').length,formPresent:!!document.querySelector('input[name=username]')&&!!document.querySelector('input[name=password]'),description:document.querySelector('meta[name=description]')?.content}));
+   await page.setViewportSize({width,height});await page.waitForTimeout(100);
+   const layout=await page.evaluate(()=>({width:innerWidth,scrollWidth:document.documentElement.scrollWidth,overflow:document.documentElement.scrollWidth>innerWidth,unnamedButtons:[...document.querySelectorAll('button')].filter(e=>!e.getAttribute('aria-label')&&!e.textContent?.trim()).length,missingAlt:document.querySelectorAll('img:not([alt])').length,formPresent:!!document.querySelector('input[name=username]')&&!!document.querySelector('input[name=password]')}));
    const screenshot=await page.screenshot({type:'png'});views.push({viewport:{width,height},...layout,screenshot:screenshot.toString('base64')});
   }
-  await page.setViewportSize({width:375,height:667});await page.locator('body').click({position:{x:1,y:1}});const focus=[];
+  await page.setViewportSize({width:375,height:667});const focus=[];
   for(let i=0;i<12;i++){await page.keyboard.press('Tab');focus.push(await page.evaluate(()=>({tag:document.activeElement.tagName,name:document.activeElement.getAttribute('aria-label')||document.activeElement.getAttribute('name')||document.activeElement.textContent?.trim().slice(0,60)})));}
-  res.json({ok:true,status:navigation.status(),errors,failures,views,focus,visitorIdentityAvailable:false});
- }catch{res.status(503).json({error:'Site browser audit unavailable'});}finally{req.body.siteToken='';await browser?.close().catch(()=>{});}
+  res.json({ok:true,views,focus,staticFixture:true,privateSiteVisited:false});
+ }catch{res.status(503).json({error:'Layout audit unavailable'});}finally{await browser?.close().catch(()=>{});}
 });
 app.post('/diagnostics/login',async(req,res)=>{
  if(Date.now()>Number(process.env.DIAGNOSTICS_EXPIRES_AT||0)||!process.env.DIAGNOSTICS_TOKEN||!equal(req.headers.authorization,'Bearer '+process.env.DIAGNOSTICS_TOKEN))return res.status(401).json({error:'Unauthorized'});
