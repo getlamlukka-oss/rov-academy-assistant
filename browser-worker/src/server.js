@@ -14,7 +14,7 @@ async function lock(s,fn){const prev=s.queue;s.queue=new Promise(r=>s.releaseQue
 function find(req){const s=sessions.get(req.params.id);if(!s)throw Error('ไม่พบเซสชัน กรุณาสร้างใหม่');s.used=Date.now();return s;}
 const wrap=fn=>async(req,res)=>{try{await fn(req,res);}catch(e){res.status(409).json({error:e.message?.slice(0,220)||'Worker error'});}};
 app.use((req,res,next)=>{res.set({'Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff'});next();});
-app.get('/health',(_req,res)=>res.json({ok:true,version:'2.2.0',service:'rov-browser-worker',sessions:sessions.size,starting:creating.size,configured:tokens.length>0,capabilities:{idempotentSessions:true,credentialLogin:true}}));
+app.get('/health',(_req,res)=>res.json({ok:true,version:'2.3.0',service:'rov-browser-worker',sessions:sessions.size,starting:creating.size,configured:tokens.length>0,capabilities:{idempotentSessions:true,credentialLogin:true,loginReadiness:true}}));
 // A session-specific view capability is exchanged for an HttpOnly cookie. It never exposes the service token.
 app.get('/live/:id',wrap(async(req,res)=>{find(req);res.type('html').send(LIVE_HTML);}));
 app.post('/live/:id/auth',wrap(async(req,res)=>{const s=find(req);if(!equal(req.body.key,s.viewKey))return res.status(401).json({error:'ลิงก์หมดอายุหรือไม่ถูกต้อง'});const name='view_'+s.id.replaceAll('-','');res.cookie(name,s.viewKey,{httpOnly:true,secure:process.env.NODE_ENV!=='test',sameSite:'strict',path:'/live/'+s.id,maxAge:30*60*1000});res.json({ok:true});}));
@@ -22,39 +22,90 @@ function liveAuth(req,res,next){const s=sessions.get(req.params.id);const name='
 app.get('/live/:id/screen',liveAuth,wrap(async(req,res)=>{const s=find(req);const jpeg=await lock(s,()=>s.page.screenshot({type:'jpeg',quality:65,timeout:8000}));res.type('jpeg').send(jpeg);}));
 app.post('/live/:id/input',liveAuth,wrap(async(req,res)=>{const s=find(req);if(s.auto)return res.status(409).json({error:'หยุดออโต้ก่อนควบคุมหน้าจอ'});const b=req.body;await lock(s,async()=>{if(b.kind==='click'){if(!Number.isFinite(b.x)||!Number.isFinite(b.y)||b.x<0||b.x>412||b.y<0||b.y>820)throw Error('Invalid position');await s.page.mouse.click(b.x,b.y);}else if(b.kind==='text'){await s.page.keyboard.insertText(String(b.text||'').slice(0,1000));}else if(b.kind==='key'){if(!['Enter','Tab','Backspace','Escape','Control+A'].includes(b.key))throw Error('Invalid key');await s.page.keyboard.press(b.key);}else if(b.kind==='scroll'){await s.page.mouse.wheel(0,Number(b.delta)>0?500:-500);}else throw Error('Invalid input');});res.json({ok:true});}));
 app.post('/live/:id/pause',liveAuth,wrap(async(req,res)=>{const s=find(req);s.auto=false;s.generation++;addLog(s,'หยุดออโต้จากหน้าล็อกอิน');res.json({ok:true});}));
+app.post('/diagnostics/login',async(req,res)=>{
+ if(Date.now()>Number(process.env.DIAGNOSTICS_EXPIRES_AT||0)||!process.env.DIAGNOSTICS_TOKEN||!equal(req.headers.authorization,'Bearer '+process.env.DIAGNOSTICS_TOKEN))return res.status(401).json({error:'Unauthorized'});
+ let browser;
+ try{
+  browser=await chromium.launch({headless:true,args:['--no-sandbox','--disable-dev-shm-usage'],timeout:45000});
+  const context=await browser.newContext({viewport:{width:412,height:820}}),page=await context.newPage();
+  await context.route('**/*',r=>r.request().isNavigationRequest()&&r.request().frame()===page.mainFrame()&&!safeHost(r.request().url())?r.abort():r.continue());
+  const s={page,state:'CREATED'};const started=Date.now();const prepared=await prepareLogin(s),snapshot=await loginSnapshot(page).catch(()=>null);
+  res.json({ok:true,elapsedMs:Date.now()-started,prepared,snapshot,credentialsSubmitted:false});
+ }catch{res.status(503).json({error:'Browser diagnostic unavailable'});}finally{await browser?.close().catch(()=>{});}
+});
 app.use((req,res,next)=>{if(!tokens.length)return res.status(503).json({error:'Worker token not configured'});if(!tokens.some(t=>equal(req.headers.authorization,'Bearer '+t)))return res.status(401).json({error:'Unauthorized'});next();});
 // Check the authenticated profile/logout UI rendered by Academy (mobile menu may be collapsed). Never read login tokens or infer login from URL.
-async function loggedIn(s){if(new URL(s.page.url()).hostname!=='academy.rov.in.th')return false;return s.page.evaluate(()=>{const visible=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&getComputedStyle(e).visibility!=='hidden'};const els=[...document.querySelectorAll('button,a,[role=button]')].filter(visible);const logout=e=>/^(ออกจากระบบ|ล็อกเอาท์|logout|log out)$/i.test((e.textContent||'').trim());const profile=document.querySelector('.menuright .user .name');const menuLabels=[...document.querySelectorAll('.menuright span,.menuright [role=button]')];return els.some(logout)||!!profile?.textContent?.trim()&&menuLabels.some(logout);});}
+async function loggedIn(s){if(new URL(s.page.url()).hostname!=='academy.rov.in.th')return false;return s.page.evaluate(()=>{const visible=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&getComputedStyle(e).visibility!=='hidden'};const els=[...document.querySelectorAll('button,a,[role=button]')].filter(visible);const logout=e=>/^(ออกจากระบบ|ล็อกเอาท์|logout|log out)$/i.test((e.textContent||'').trim());const profile=document.querySelector('.menuright .user .name');const menuLabels=[...document.querySelectorAll('.menuright span,.menuright [role=button]')];return els.some(logout)||!!profile?.textContent?.trim()&&menuLabels.some(logout);}).catch(()=>false);}
 // Academy's published OAuth configuration: app 100055, Garena platform 1, its own callback.
 const GARENA_LOGIN='https://100055.connect.garena.com/oauth/login?response_type=code&client_id=100055&redirect_uri=https%3A%2F%2Facademy.rov.in.th%2Fauth%2Fcallback%2F&locale=th-TH&platform=1';
 function credentialHost(url){try{const u=new URL(url);return u.protocol==='https:'&&['100055.connect.garena.com','sso.garena.com','auth.garena.com','account.garena.com'].includes(u.hostname);}catch{return false;}}
+const loginMessages={
+ CAPTCHA_REQUIRED:'Garena ต้องการยืนยัน CAPTCHA กรุณาทำในหน้าจอด้านล่าง แล้วกดเข้าสู่ระบบอีกครั้ง',
+ LOGIN_FORM_UNAVAILABLE:'Garena ยังไม่แสดงช่องล็อกอิน กรุณาตรวจหน้าจอด้านล่างแล้วลองอีกครั้ง',
+ LOGIN_INPUT_NOT_READY:'ช่องล็อกอิน Garena ยังไม่พร้อมกรอก กรุณาตรวจหน้าจอด้านล่าง',
+ LOGIN_REJECTED:'Garena ยังไม่ยอมรับการล็อกอิน กรุณาตรวจข้อความในหน้าจอด้านล่าง',
+ LOGIN_PENDING:'ส่งบัญชีไป Garena แล้ว กรุณาตรวจ CAPTCHA / OTP ในหน้าจอด้านล่าง',
+ LOGIN_PAGE_UNAVAILABLE:'เปิดหน้าล็อกอิน Garena ไม่สำเร็จ กรุณาลองอีกครั้ง',
+ LOGIN_READY:'หน้าล็อกอิน Garena พร้อมกรอกบัญชีแล้ว'
+};
+async function loginSnapshot(page){return page.evaluate(()=>{
+ const visible=e=>{const r=e.getBoundingClientRect(),c=getComputedStyle(e);return r.width>0&&r.height>0&&c.display!=='none'&&c.visibility!=='hidden';};
+ const inputs=[...document.querySelectorAll('input')].filter(visible);
+ const passwords=inputs.filter(e=>e.type==='password');const form=passwords[0]?.closest('form');
+ const usernames=(form?[...form.querySelectorAll('input')]:inputs).filter(e=>visible(e)&&['text','email','tel'].includes(e.type)&&!e.readOnly);
+ const challenge=[...document.querySelectorAll('iframe[src*="captcha"],iframe[src*="datadome"],[id*=captcha],[class*=captcha]')].some(visible);
+ const rejected=[...document.querySelectorAll('.field.error,.form-error,[role=alert]')].some(e=>visible(e)&&e.textContent?.trim());
+ return {host:location.hostname,passwordCount:passwords.length,usernameCount:usernames.length,editable:passwords.length===1&&usernames.length===1&&!passwords[0].disabled&&!passwords[0].readOnly&&!usernames[0].disabled,challenge,rejected,fields:inputs.map(e=>({type:e.type,disabled:e.disabled,readOnly:e.readOnly}))};
+ });}
+function waitingLogin(s,reason,submitted=false){s.state=reason==='CAPTCHA_REQUIRED'?'WAITING_CHALLENGE':'WAITING_LOGIN';return {loggedIn:false,submitted,needsInteraction:true,reason,message:loginMessages[reason]};}
+async function prepareLogin(s){
+ if(await loggedIn(s))return {loggedIn:true,submitted:false};
+ if(!credentialHost(s.page.url())){try{await s.page.goto(GARENA_LOGIN,{waitUntil:'commit',timeout:15000});}catch{return waitingLogin(s,'LOGIN_PAGE_UNAVAILABLE');}}
+ const until=Date.now()+20000;
+ while(Date.now()<until){
+  if(await loggedIn(s))return {loggedIn:true,submitted:false};
+  if(credentialHost(s.page.url())){
+   const v=await loginSnapshot(s.page).catch(()=>null);
+   if(v?.challenge)return waitingLogin(s,'CAPTCHA_REQUIRED');
+   if(v?.editable){s.state='LOGIN_READY';return {loggedIn:false,ready:true,reason:'LOGIN_READY',message:loginMessages.LOGIN_READY};}
+  }
+  await sleep(400);
+ }
+ const v=await loginSnapshot(s.page).catch(()=>null);
+ return waitingLogin(s,v?.challenge?'CAPTCHA_REQUIRED':v?.passwordCount?'LOGIN_INPUT_NOT_READY':'LOGIN_FORM_UNAVAILABLE');
+}
 async function enterCredentials(s,b){
  if(s.auto)throw Error('Pause first');
- if(await loggedIn(s))return {loggedIn:true,submitted:false};
- let submitted=false;
- s.enteringCredentials=true;
+ let submitted=false,stage='prepare';s.enteringCredentials=true;
  try{
-  if(!credentialHost(s.page.url()))await s.page.goto(GARENA_LOGIN,{waitUntil:'domcontentloaded',timeout:15000});
-  // Never fill on Academy, Facebook, a CAPTCHA frame or an unrecognized host.
-  const password=s.page.locator('input[type="password"]:visible');
-  await password.first().waitFor({state:'visible',timeout:8000});
-  const username=s.page.locator('input[type="text"]:visible,input[type="email"]:visible,input[type="tel"]:visible');
-  if(!credentialHost(s.page.url())||await password.count()!==1||await username.count()!==1)throw Error('Unrecognized login form');
-  const safeForm=await password.evaluate(e=>{const f=e.closest('form');const a=f?.getAttribute('action');if(!a)return true;const u=new URL(a,location.href);return u.protocol==='https:'&&['100055.connect.garena.com','sso.garena.com','auth.garena.com','account.garena.com'].includes(u.hostname);});
-  if(!safeForm)throw Error('Invalid form target');
-  await username.fill(b.username,{timeout:3000});
-  if(!credentialHost(s.page.url()))throw Error('Login page changed');
-  await password.fill(b.password,{timeout:3000});
-  b.username='';b.password='';
-  const button=s.page.locator('button[type="submit"]:visible,input[type="submit"]:visible');
-  if(!credentialHost(s.page.url())||await button.count()!==1)throw Error('Unrecognized submit button');
-  await button.click({timeout:3000});submitted=true;
+  const prepared=await prepareLogin(s);if(!prepared.ready)return prepared;
+  stage='recognize-form';const password=s.page.locator('input[type="password"]:visible');
+  const form=password.locator('xpath=ancestor::form[1]');const root=await form.count()===1?form:s.page;
+  const username=root.locator('input[type="text"]:visible:not([readonly]),input[type="email"]:visible:not([readonly]),input[type="tel"]:visible:not([readonly])');
+  if(!credentialHost(s.page.url())||await password.count()!==1||await username.count()!==1)return waitingLogin(s,'LOGIN_FORM_UNAVAILABLE');
+  const safeForm=await password.evaluate(e=>{const f=e.closest('form'),a=f?.getAttribute('action');if(!a)return true;const u=new URL(a,location.href);return u.protocol==='https:'&&['100055.connect.garena.com','sso.garena.com','auth.garena.com','account.garena.com'].includes(u.hostname);});
+  if(!safeForm)return waitingLogin(s,'LOGIN_FORM_UNAVAILABLE');
+  stage='fill-username';await username.fill(b.username,{timeout:7000});
+  if(!credentialHost(s.page.url()))return waitingLogin(s,'LOGIN_FORM_UNAVAILABLE');
+  stage='fill-password';await password.fill(b.password,{timeout:7000});b.username='';b.password='';
+  const button=root.locator('button[type="submit"]:visible,input[type="submit"]:visible');
+  if(!credentialHost(s.page.url())||await button.count()!==1)return waitingLogin(s,'LOGIN_FORM_UNAVAILABLE');
+  stage='submit';await button.click({timeout:7000});submitted=true;
   const until=Date.now()+6000;
-  while(Date.now()<until){if(await loggedIn(s))return {loggedIn:true,submitted:true};await sleep(500);}
-  return {loggedIn:false,submitted:true,needsInteraction:true};
+  while(Date.now()<until){
+   if(await loggedIn(s)){s.state='WAITING_QUIZ';return {loggedIn:true,submitted:true,message:'ตรวจพบล็อกอิน Garena แล้ว'};}
+   const v=credentialHost(s.page.url())?await loginSnapshot(s.page).catch(()=>null):null;
+   if(v?.challenge)return waitingLogin(s,'CAPTCHA_REQUIRED',true);
+   if(v?.rejected)return waitingLogin(s,'LOGIN_REJECTED',true);
+   await sleep(500);
+  }
+  return waitingLogin(s,'LOGIN_PENDING',true);
+ }catch{
+  let host='unknown';try{host=new URL(s.page.url()).hostname;}catch{}
+  console.warn(JSON.stringify({event:'login_flow',stage,host,reason:'LOGIN_INPUT_NOT_READY'}));
+  return waitingLogin(s,submitted?'LOGIN_PENDING':'LOGIN_INPUT_NOT_READY',submitted);
  }finally{
   s.enteringCredentials=false;b.username='';b.password='';
-  // Clear failed preparation. An official submitted form may need its password to finish CAPTCHA.
   if(!submitted&&!s.page.isClosed()&&credentialHost(s.page.url()))await s.page.locator('input[type="password"]').fill('',{timeout:1000}).catch(()=>{});
  }
 }
@@ -106,12 +157,13 @@ app.post('/sessions',wrap(async(req,res)=>{
 app.post('/sessions/:id/start',wrap(async(req,res)=>{const s=find(req);if(s.state!=='CREATED')return res.json({ok:true});if(!s.startPromise)s.startPromise=lock(s,()=>s.page.goto(START,{waitUntil:'commit',timeout:20000})).then(()=>{s.state='WAITING_LOGIN';}).catch(e=>{s.startPromise=null;throw e;});await s.startPromise;res.json({ok:true});}));
 app.get('/sessions/:id/live',wrap(async(req,res)=>{if(creating.has(req.params.id))return res.status(202).json({pending:true,state:'CREATING'});if(failedCreations.has(req.params.id))throw Error(failedCreations.get(req.params.id));res.json(liveView(find(req),req));}));
 app.get('/sessions/:id/login-status',wrap(async(req,res)=>{if(creating.has(req.params.id))return res.status(202).json({loggedIn:false,pending:true,state:'CREATING',auto:false,answered:0});const s=find(req);res.json({loggedIn:await lock(s,()=>loggedIn(s)),pending:false,...status(s)});}));
+app.post('/sessions/:id/prepare-login',wrap(async(req,res)=>{const s=find(req);if(s.auto)throw Error('หยุดออโต้ก่อนล็อกอิน');res.json({...await lock(s,()=>prepareLogin(s)),...liveView(s,req)});}));
 app.post('/sessions/:id/credentials',async(req,res)=>{
  try{
   if(typeof req.body.username!=='string'||!req.body.username.trim()||req.body.username.length>150||typeof req.body.password!=='string'||!req.body.password||req.body.password.length>1024)return res.status(400).json({error:'กรอกบัญชีและรหัสผ่านให้ครบ'});
   const s=find(req);if(s.auto)return res.status(409).json({error:'หยุดออโต้ก่อนล็อกอิน'});
-  res.json(await lock(s,()=>enterCredentials(s,req.body)));
- }catch{res.status(409).json({error:'กรอกบัญชีในหน้า Garena ไม่สำเร็จ กรุณาเปิดหน้าจอเพื่อตรวจ CAPTCHA / OTP หรือรูปแบบหน้าล็อกอิน'});}
+  res.json({...await lock(s,()=>enterCredentials(s,req.body)),...liveView(s,req)});
+ }catch{res.status(409).json({error:'ไม่พบเซสชัน กรุณาสร้างใหม่'});}
  finally{req.body.username='';req.body.password='';}
 });
 app.get('/sessions/:id/question',wrap(async(req,res)=>{const s=find(req);if(!await lock(s,()=>loggedIn(s)))throw Error('ยังไม่พบล็อกอิน Garena');res.json(await lock(s,()=>quiz(s)));}));
@@ -133,4 +185,4 @@ document.getElementById('send').onclick=()=>{const t=document.getElementById('te
 async function refresh(){if(!running||loading)return;loading=true;try{const r=await fetch(base+'/screen');if(!r.ok){const d=await r.json();throw Error(d.error);}const next=URL.createObjectURL(await r.blob());screen.src=next;if(url)URL.revokeObjectURL(url);url=next;}catch(e){msg.textContent=e.message;}finally{loading=false;}}
 send('/auth',{key}).then(()=>{msg.textContent='เชื่อมต่อแล้ว แตะหน้าจอเพื่อล็อกอิน';refresh();setInterval(refresh,1600);}).catch(e=>msg.textContent=e.message);addEventListener('pagehide',()=>{running=false;if(url)URL.revokeObjectURL(url);});
 </script></html>`;
-app.listen(PORT,'0.0.0.0',()=>console.log('Browser Worker v2.1 listening on '+PORT));
+app.listen(PORT,'0.0.0.0',()=>console.log('Browser Worker v2.3 listening on '+PORT));
